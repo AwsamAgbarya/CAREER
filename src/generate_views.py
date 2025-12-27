@@ -10,6 +10,34 @@ import json
 import argparse
 from tqdm import tqdm 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Render random views from a Gaussian Splatting scene.")
+    parser.add_argument("--base_ply", type=str, default="../data/Docking.ply",
+                        help="Path to the base object PLY file.")
+    parser.add_argument("--keypoint_ply", type=str, default="../data/keypoints.ply",
+                        help="Path to the keypoints PLY file.")
+    parser.add_argument("--out_dir", type=str, default="../renders",
+                        help="Output directory for rendered images and masks.")
+    parser.add_argument("--height", type=int, default=1080,
+                        help="Output image height in pixels.")
+    parser.add_argument("--width", type=int, default=1280,
+                        help="Output image width in pixels.")
+    parser.add_argument("--focal", type=float, default=800.0,
+                        help="Camera focal length.")
+    parser.add_argument("--near", type=float, default=0.01,
+                        help="Near plane distance.")
+    parser.add_argument("--far", type=float, default=100.0,
+                        help="Far plane distance.")
+    parser.add_argument("--num_views", type=int, default=1,
+                        help="Number of random views to render.")
+    parser.add_argument("--radius_min", type=float, default=7.0,
+                        help="Minimum radius for random camera placement.")
+    parser.add_argument("--radius_max", type=float, default=12.0,
+                        help="Maximum radius for random camera placement.")
+    args = parser.parse_args()
+    return args
+
+
 def load_ply(path, is_keypoint, device="cuda"):
     """
     Load a PLY file and extract Gaussian point cloud data.
@@ -188,6 +216,129 @@ def look_at(camera_pos, target, up_axis='y'):
     
     return view_mats
 
+# Copied from pytorch3d sourcecode
+def _angle_from_tan(
+    axis: str, other_axis: str, data, horizontal: bool, tait_bryan: bool
+) -> torch.Tensor:
+    """
+    Extract the first or third Euler angle from the two members of
+    the matrix which are positive constant times its sine and cosine.
+    """
+    i1, i2 = ("XYZ".index(axis), "XYZ".index(other_axis))
+    if horizontal:
+        # matrix[:, i1, 2], matrix[:, i2, 2]
+        odd = data[..., i2, 2]
+        even = data[..., i1, 2]
+    else:
+        # matrix[:, 2, i1], matrix[:, 2, i2]
+        odd = data[..., 2, i2]
+        even = data[..., 2, i1]
+
+    if tait_bryan:
+        return torch.atan2(odd, even)
+    else:
+        return torch.atan2(even, odd)
+
+# Copied from pytorch3d sourcecode
+def matrix_to_euler_angles(matrix: torch.Tensor, convention: str) -> torch.Tensor:
+    """
+    Convert rotations given as rotation matrices to Euler angles in radians.
+
+    Args:
+        matrix: Rotation matrices as tensor of shape (..., 3, 3).
+        convention: Convention string of three uppercase letters from
+            {"X", "Y", "Z"}.
+
+    Returns:
+        Euler angles in radians as tensor of shape (..., 3).
+    """
+    if matrix.shape[-2:] != (3, 3):
+        raise ValueError("matrix must have shape (..., 3, 3)")
+    if len(convention) != 3:
+        raise ValueError("Convention must have 3 letters.")
+    if convention[1] == convention[0] or convention[1] == convention[2]:
+        raise ValueError("Invalid convention {}".format(convention))
+
+    # Check for valid rotation matrices
+    eps = 1e-6
+    det = torch.det(matrix)
+    if not torch.allclose(det, torch.ones_like(det), atol=1e-3, rtol=0):
+        raise ValueError("matrix is not a valid rotation matrix.")
+
+    # Tait-Bryan if first and last axes differ, otherwise proper Euler
+    tait_bryan = convention[0] != convention[2]
+
+    i0 = "XYZ".index(convention[0])
+    i1 = "XYZ".index(convention[1])
+    i2 = "XYZ".index(convention[2])
+
+    if tait_bryan:
+        # sin of middle angle is -matrix[..., i0, i2]
+        middle_angle = torch.asin(-matrix[..., i0, i2].clamp(-1 + eps, 1 - eps))
+        cos_middle = torch.cos(middle_angle)
+
+        # if cos_middle is small, gimbal lock: set first angle to 0
+        mask = torch.abs(cos_middle) > eps
+
+        # normal case
+        first_angle = torch.zeros_like(middle_angle)
+        third_angle = torch.zeros_like(middle_angle)
+
+        first_angle[mask] = _angle_from_tan(
+            convention[0], convention[1], matrix[mask], horizontal=False, tait_bryan=True
+        )
+        third_angle[mask] = _angle_from_tan(
+            convention[2], convention[1], matrix[mask], horizontal=True, tait_bryan=True
+        )
+
+        # gimbal lock case
+        # when cos_middle ~ 0, first+/-third is determined
+        if convention[0] == "X" and convention[2] == "Z":
+            sign = torch.sign(matrix[..., i1, i0])
+        else:
+            sign = torch.sign(matrix[..., i0, i1])
+        first_angle[~mask] = 0.0
+        third_angle[~mask] = torch.atan2(
+            sign[~mask] * matrix[..., i1, i2][~mask], sign[~mask] * matrix[..., i1, i1][~mask]
+        )
+    else:
+        # proper Euler
+        # cos of middle angle is matrix[..., i1, i1]
+        middle_angle = torch.acos(matrix[..., i1, i1].clamp(-1 + eps, 1 - eps))
+        sin_middle = torch.sin(middle_angle)
+
+        mask = torch.abs(sin_middle) > eps
+
+        first_angle = torch.zeros_like(middle_angle)
+        third_angle = torch.zeros_like(middle_angle)
+
+        first_angle[mask] = _angle_from_tan(
+            convention[0], convention[1], matrix[mask], horizontal=True, tait_bryan=False
+        )
+        third_angle[mask] = _angle_from_tan(
+            convention[2], convention[1], matrix[mask], horizontal=False, tait_bryan=False
+        )
+
+        # gimbal lock: set third angle to 0 and absorb into first
+        sign = torch.sign(matrix[..., i0, i2])
+        first_angle[~mask] = torch.atan2(
+            sign[~mask] * matrix[..., i0, i1][~mask], sign[~mask] * matrix[..., i0, i0][~mask]
+        )
+        third_angle[~mask] = 0.0
+
+    return torch.stack((first_angle, middle_angle, third_angle), dim=-1)
+
+def cam_matrix_to_6dof(c2w: torch.Tensor, convention: str = "XYZ"):
+    """
+    c2w: (4, 4) camera-to-world transform.
+    Returns: translation (3,), rotation_euler (3,) where rotation is in radians.
+    """
+    assert c2w.shape == (4, 4)
+    R = c2w[:3, :3]          # rotation
+    t = c2w[:3, 3]           # translation
+    euler = matrix_to_euler_angles(R.unsqueeze(0), convention=convention)[0]  # (3,)
+    return t, euler
+
 def random_view_bottom_cone(num_views, radius_range=(3.0, 5.0), theta_range_deg=(120, 150)):
     """
     Generates N random view matrices from a specific band of the sphere.
@@ -232,33 +383,6 @@ def random_view_bottom_cone(num_views, radius_range=(3.0, 5.0), theta_range_deg=
 def tensor_to_list(tensor):
     return tensor.cpu().numpy().tolist()
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Render random views from a Gaussian Splatting scene.")
-    parser.add_argument("--base_ply", type=str, default="../data/Docking.ply",
-                        help="Path to the base object PLY file.")
-    parser.add_argument("--keypoint_ply", type=str, default="../data/keypoints.ply",
-                        help="Path to the keypoints PLY file.")
-    parser.add_argument("--out_dir", type=str, default="./renders",
-                        help="Output directory for rendered images and masks.")
-    parser.add_argument("--height", type=int, default=1080,
-                        help="Output image height in pixels.")
-    parser.add_argument("--width", type=int, default=1280,
-                        help="Output image width in pixels.")
-    parser.add_argument("--focal", type=float, default=800.0,
-                        help="Camera focal length.")
-    parser.add_argument("--near", type=float, default=0.01,
-                        help="Near plane distance.")
-    parser.add_argument("--far", type=float, default=100.0,
-                        help="Far plane distance.")
-    parser.add_argument("--num_views", type=int, default=1,
-                        help="Number of random views to render.")
-    parser.add_argument("--radius_min", type=float, default=7.0,
-                        help="Minimum radius for random camera placement.")
-    parser.add_argument("--radius_max", type=float, default=12.0,
-                        help="Maximum radius for random camera placement.")
-    args = parser.parse_args()
-    return args
-
 if __name__ == "__main__":
     args = parse_args()
     base_ply = args.base_ply
@@ -281,10 +405,12 @@ if __name__ == "__main__":
         json_path = os.path.join(out_dir, f"view_{i:05d}_params.json")
 
         c2w = torch.linalg.inv(view_w2c)
+        t, euler = cam_matrix_to_6dof(c2w, convention="XYZ")
 
         view_dict = {
             "file_path": f"view_{i:03d}_rgb.png",
-            "transform_matrix": tensor_to_list(c2w),
+            "position": tensor_to_list(t),
+            "rotation_xyz": tensor_to_list(euler),
             "camera_angle_x": 2 * np.arctan(W / (2 * focal)),
             "fl_x": focal,
             "fl_y": focal,

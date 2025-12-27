@@ -1,2 +1,6 @@
 # Data directories
 renders
+
+
+# Test files
+*.ipynb
