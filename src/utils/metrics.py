@@ -81,6 +81,105 @@ class SegmentationMetrics:
         
         return summary
 
+
+class KeypointMetrics:
+    def __init__(self, num_classes=6, class_names=None, threshold=5.0):
+        """
+        Args:
+            threshold (float): Distance threshold (pixels) to consider a detection 'correct'.
+        """
+        self.num_classes = num_classes
+        self.class_names = class_names or [f"class_{i}" for i in range(num_classes)]
+        self.threshold = threshold
+        self.reset()
+    
+    def reset(self):
+        # Store errors for each class to compute means later
+        self.errors = {i: [] for i in range(self.num_classes)}
+        # Store hits (correct detections) vs total attempts
+        self.detections = {i: 0 for i in range(self.num_classes)}
+        self.counts = {i: 0 for i in range(self.num_classes)}
+        
+    def get_coords_from_heatmap(self, heatmap):
+        """
+        Find (x, y) coordinates of peak in heatmap.
+        heatmap: [B, C, H, W]
+        Returns: [B, C, 2] coordinates (x, y)
+        """
+        batch_size, num_classes, h, w = heatmap.shape
+        # Flatten H,W to find max index
+        flat_map = heatmap.view(batch_size, num_classes, -1)
+        max_vals, max_indices = torch.max(flat_map, dim=2)
+        
+        # Convert index back to (x, y)
+        y = (max_indices // w).float()
+        x = (max_indices % w).float()
+        
+        coords = torch.stack([x, y], dim=2) # [B, C, 2]
+        return coords, max_vals
+
+    def update(self, pred_logits, target_heatmaps):
+        """
+        Args:
+            pred_logits: (B, C, H, W) Logits from model
+            target_heatmaps: (B, C, H, W) GT Heatmaps (0..1)
+        """
+        # Apply Sigmoid to prediction
+        pred_maps = torch.sigmoid(pred_logits)
+        
+        # Get Coordinates of peaks
+        pred_coords, pred_confs = self.get_coords_from_heatmap(pred_maps)
+        gt_coords, gt_confs = self.get_coords_from_heatmap(target_heatmaps)
+        
+        # Compute Metrics
+        batch_size = pred_coords.shape[0]
+        
+        for b in range(batch_size):
+            for c in range(self.num_classes): # Skip background (Index 0) usually
+                if gt_confs[b, c] > 0.5:
+                    # Euclidean Distance
+                    dist = torch.norm(pred_coords[b, c] - gt_coords[b, c]).item()
+                    
+                    self.errors[c].append(dist)
+                    self.counts[c] += 1
+                    
+                    if dist <= self.threshold:
+                        self.detections[c] += 1
+
+    def get_summary(self):
+        summary = {}
+        total_error = []
+        total_detections = 0
+        total_counts = 0
+        
+        for c in range(self.num_classes): # Skip Background
+            name = self.class_names[c]
+            
+            # Mean Radial Error (Pixel Distance)
+            if self.errors[c]:
+                mre = np.mean(self.errors[c])
+                summary[f'{name}_MRE'] = mre
+                total_error.extend(self.errors[c])
+            else:
+                summary[f'{name}_MRE'] = 0.0
+            
+            # Detection Rate (PCK)
+            if self.counts[c] > 0:
+                pck = self.detections[c] / self.counts[c]
+                summary[f'{name}_PCK'] = pck
+                
+                total_detections += self.detections[c]
+                total_counts += self.counts[c]
+            else:
+                summary[f'{name}_PCK'] = 0.0
+        
+        # Global Metrics
+        summary['Mean_Error'] = np.mean(total_error) if total_error else 0.0
+        summary['Mean_PCK'] = total_detections / total_counts if total_counts > 0 else 0.0
+        summary['mIoU'] = summary['Mean_PCK'] 
+        
+        return summary
+
 class EMA:
     """Exponential Moving Average for model weights."""
     

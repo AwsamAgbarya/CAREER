@@ -1,7 +1,6 @@
 import torch
 from torch.utils.data import Dataset
 from torchvision.transforms.functional import pil_to_tensor
-import torchvision.transforms.functional as TF
 
 import numpy as np
 from PIL import Image
@@ -10,25 +9,23 @@ from pathlib import Path
 import json
 import os
 import kornia.morphology as morph
-import kornia.augmentation as K
 from tqdm import tqdm
 
 class KeypointDataset(Dataset):
-    def __init__(self, data_directory, crop_size=(128,128), background_directory=None, mode="segment_six", fix_holes=True):  # Generate 10 variants per image
+    def __init__(self, data_directory, crop_size=(128,128), background_directory=None, mode="segment_six",  sigma=3.0, H=720, W=1280, max_N = None):
         
         self.data_directory = data_directory
-        self.N = len(os.listdir(data_directory))//4
-        self.H, self.W = 720, 1280
+        self.N = len(os.listdir(data_directory))//4 if max_N is None else max_N
+        self.H, self.W = H, W
         self.crop_size = crop_size
-        self.fix_holes = fix_holes
+        self.sigma = sigma
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using {device} for preprocessing...")
 
         # Setup backgrounds
         self.backgrounds = []
         if background_directory:
-            bg_files = [str(f) for f in Path(background_directory).rglob('*')
-                       if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg']]
+            bg_files = [str(f) for f in Path(background_directory).rglob('*') if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg']]
             
             print(f"Pre-loading {len(bg_files)} backgrounds...")
             for bg_file in tqdm(bg_files):
@@ -37,53 +34,72 @@ class KeypointDataset(Dataset):
         
         # Setup class remapping
         if mode == "segment_six":
-            self.accepted_classes = torch.tensor([0,3,5,7,8,10,12], dtype=torch.long).to(device)
-            self.map_index = torch.tensor([0,1,2,3,4,5,6], dtype=torch.long).to(device)
+            self.accepted_classes = torch.tensor([3,5,7,8,10,12], dtype=torch.long).to(device)
+            self.map_index = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.long).to(device)
+            self.num_classes = 6
+        elif mode == "segment_all":
+            self.accepted_classes = torch.tensor([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], dtype=torch.long).to(device)
+            self.map_index = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], dtype=torch.long).to(device)
+            self.num_classes = 11
         else:
             raise ValueError("Unavailable mode")
         
         self.class_remap_table = torch.zeros(256, dtype=torch.long).to(device)
         self.class_remap_table[self.accepted_classes] = self.map_index
-        
-        if self.fix_holes:
-            self.morph_kernel = torch.ones(3, 3).to(device)
-
         self.images = torch.zeros((self.N, 3, crop_size[0], crop_size[1]), dtype=torch.float32)
-        self.masks = torch.zeros((self.N, crop_size[0], crop_size[1]), dtype=torch.long)
+        self.heatmaps = torch.zeros((self.N, self.num_classes, crop_size[0], crop_size[1]), dtype=torch.float32)
+        self.masks = torch.zeros((self.N, 1, crop_size[0], crop_size[1]), dtype=torch.float32)
         
         for idx_orig in tqdm(range(self.N), desc="GPU preprocessing"):
             prefix = os.path.join(self.data_directory, f"view_{idx_orig:05d}")
             img = pil_to_tensor(Image.open(f"{prefix}_rgb.jpeg").convert("RGB")).float().to(device) / 255.0
             mask = pil_to_tensor(Image.open(f"{prefix}_mask.png")).to(device)
             
-            # Process single image
-            img_aug = img
-            mask_aug = mask
-            
             # Background
             if len(self.backgrounds) > 0:
                 bg = self.backgrounds[np.random.randint(len(self.backgrounds))]
-                mask_3d = (mask_aug == 0).expand(3, -1, -1)
-                img_aug = torch.where(mask_3d, bg, img_aug)
+                mask_3d = (mask == 0).expand(3, -1, -1)
+                img = torch.where(mask_3d, bg, img)
             
             # Remap + fill
-            mask_aug = self.class_remap_table[mask_aug.long()]
-            if self.fix_holes:
-                mask_aug = self._fill_mask_holes(mask_aug)
-            
+            mask = self.class_remap_table[mask.long()]
             # Crop
-            img_crop, mask_crop = crop_centered_on_mask(img_aug, mask_aug, crop_size=self.crop_size)
+            img_crop, mask_crop = crop_centered_on_mask(img, mask, crop_size=self.crop_size)
             
             # Store to CPU RAM
             self.images[idx_orig] = img_crop.cpu()
-            self.masks[idx_orig] = mask_crop.squeeze(0).cpu()
+            self.heatmaps[idx_orig] = self.generate_gaussian_heatmaps(mask_crop.squeeze(0))
+            self.masks[idx_orig] = mask_crop.cpu()
         self.backgrounds = [bg.cpu() for bg in self.backgrounds]
         
         print(f"Dataset ready: {self.N} samples using {self.images.element_size() * self.images.nelement() / 1e9:.2f} GB RAM")
     
     def __getitem__(self, idx):
-        return self.images[idx], self.masks[idx]
+        return self.images[idx], self.heatmaps[idx]
     
+    def generate_gaussian_heatmaps(self, mask):
+        """
+        Converts a segmentation mask (integers) into Gaussian heatmaps.
+        mask: [H, W] tensor with values 0..6
+        """
+        h, w = mask.shape
+        heatmaps = torch.zeros((self.num_classes, h, w), dtype=torch.float32, device=mask.device)
+        
+        # Create coordinate grid once (can be cached in __init__ for speed)
+        y = torch.arange(h, dtype=torch.float32, device=mask.device).unsqueeze(1)
+        x = torch.arange(w, dtype=torch.float32, device=mask.device).unsqueeze(0)
+        
+        # Iterate over hole classes (0 to 5)
+        for class_id in range(1, self.num_classes + 1):
+            coords = torch.nonzero(mask == class_id)
+            if coords.shape[0] > 0:
+                center_y = coords[:, 0].float().mean()
+                center_x = coords[:, 1].float().mean()
+                dist_sq = (x - center_x)**2 + (y - center_y)**2
+                heatmap = torch.exp(-dist_sq / (2.0 * self.sigma**2))
+                heatmaps[class_id - 1] = heatmap
+        return heatmaps
+        
     def _fill_mask_holes(self, mask):
         """Vectorized morphological closing"""
         unique_ids = torch.unique(mask)

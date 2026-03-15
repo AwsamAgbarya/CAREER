@@ -11,21 +11,21 @@ from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from torch.utils.data import Subset
 import bitsandbytes as bnb
+import json
 
-from utils.loss import CombinedLoss
-from utils.metrics import SegmentationMetrics, EMA
+# Import your updated modules
+from utils.loss import HeatmapAWingMSE
+from utils.metrics import KeypointMetrics
 
-class SegmentationTrainer:
+class KeypointTrainer:
     
-    def __init__(self, model, dataset, class_weights, config, device='cuda'):
+    def __init__(self, model, dataset, config, device='cuda'):
         self.model = model
         self.dataset = dataset
         self.config = config
         self.device = device
-        self.num_classes = config.get('num_classes', 7)
-        self.class_names = config['class_names']
-        if class_weights is not None:
-            self.class_weights = class_weights.to(device=device, dtype=torch.float32)
+        self.num_classes = config.get('num_classes', 6)
+        self.class_names = config.get('class_names', [f'kp_{i}' for i in range(self.num_classes)])
         
         # Setup directories
         self.checkpoint_dir = Path(config.get('checkpoint_dir', './checkpoints'))
@@ -37,17 +37,17 @@ class SegmentationTrainer:
         warmup_epochs = config.get('warmup_epochs', 5)
         total_epochs = config.get('epochs', 50)
 
-        # Loss function - use combined loss
-        self.criterion = CombinedLoss(
-            ce_weight=config.get('ce_weight', 0.3),
-            dice_weight=config.get('dice_weight', 0.3),
-            focal_weight=config.get('focal_weight', 0.3),
-            boundary_weight=config.get('boundary_weight', 0.1),
-            class_weights=self.class_weights,
-            focal_gamma=config.get('focal_gamma', 2.0),
+        # Loss function - Adaptive Wing Loss for Heatmaps
+        self.criterion = HeatmapAWingMSE(
+            wing_weight=config.get('w_weight', 2.1),
+            mse_weight=config.get('mse_weight', 2.1),
+            alpha=config.get('alpha', 2.1),
+            omega=config.get('omega', 14.0),
+            epsilon=config.get('epsilon', 1.0),
+            theta=config.get('theta', 0.5)
         )
         
-        # Optimizer - differential learning rates
+        # Optimizer
         backbone_params = [p for n, p in model.named_parameters() if 'backbone' in n]
         decoder_params = [p for n, p in model.named_parameters() if 'seg_head' in n]
         self.optimizer = bnb.optim.AdamW8bit([
@@ -65,27 +65,44 @@ class SegmentationTrainer:
             milestones=[warmup_epochs]
         )
         
-        # Mixed precision training
+        # Mixed precision
         self.scaler = GradScaler(device='cuda')
-        # self.ema = EMA(model, decay=config.get('ema_decay', 0.999))
         
-        # Metrics
-        self.metrics = SegmentationMetrics(num_classes=self.num_classes, class_names=self.class_names)
-        
+        # Metrics - Using Keypoint Metrics (PCK, Mean Error)
+        self.metrics = KeypointMetrics(
+            num_classes=self.num_classes, 
+            class_names=self.class_names,
+            threshold=config.get('metric_threshold', 5.0) # 5 pixel threshold
+        )
+
         # Tracking
-        self.best_miou = 0.0
+        self.best_pck = 0.0 # Track PCK instead of mIoU
         self.train_losses = []
         self.val_metrics = []
+
+                # Histories for plotting
+        self.history = {
+            "epoch": [],
+            "train_loss": [],
+            "val_loss": [],
+            "mean_pck": [],
+            "mean_error": [],
+        }
+        # Per-class histories (dict of name -> list)
+        self.class_history = {
+            name: {"PCK": [], "MRE": []}
+            for name in self.class_names
+        }
+
 
         val_split = config.get('val_split', 0.2)
         val_size = int(len(dataset) * val_split)
         indices = list(range(len(dataset)))
         
-        # Store indices as instance variables
         self.train_indices = indices[:-val_size]
         self.val_indices = indices[-val_size:]
         
-        # Create DataLoaders once
+        # Create DataLoaders
         train_dataset = Subset(dataset, self.train_indices)
         val_dataset = Subset(dataset, self.val_indices)
         
@@ -101,54 +118,46 @@ class SegmentationTrainer:
         self.val_loader = DataLoader(
             val_dataset,
             batch_size=config.get('batch_size', 32),
-            shuffle=False,
+            shuffle=True,
             persistent_workers=True,
             num_workers=config.get('num_workers', 2),
             pin_memory=True,
         )
             
-        # W&B logging
         if config.get('use_wandb', False):
-            wandb.init(project=config.get('wandb_project', 'vmamba-seg'), config=config)
+            wandb.init(project=config.get('wandb_project', 'vmamba-keypoints'), config=config)
     
     def train_epoch(self):
         self.model.train()
-        
         total_loss = 0.0
-        loss_components = defaultdict(float)
         accumulation_steps = self.config.get('accumulation_steps', 1)
         
         pbar = tqdm(self.train_loader, desc='Training')
-        for batch_idx, (img, mask) in enumerate(pbar):
+        for batch_idx, (img, heatmaps) in enumerate(pbar):
             img = img.to(self.device, non_blocking=True)
-            mask = mask.squeeze(1).long().to(self.device, non_blocking=True)
+            # heatmaps are [B, C, H, W] float tensors
+            heatmaps = heatmaps.to(self.device, non_blocking=True)
 
             # Forward + backward
             with autocast(device_type='cuda'):
-                seg_logits = self.model(img)
-                loss, loss_dict = self.criterion(seg_logits, mask)
+                logits = self.model(img) # [B, C, H, W] logits
+                loss = self.criterion(logits, heatmaps)
                 loss = loss / accumulation_steps
             
             self.scaler.scale(loss).backward()
             
-            # Update every N steps
+            # Update weights
             if (batch_idx + 1) % accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad()
-                # self.ema.update()
             
-            # Logging
             loss_val = loss.item() * accumulation_steps
-            total_loss += loss_val
-            for key, val in loss_dict.items():
-                loss_components[key] += val
-            
+            total_loss += loss_val 
             pbar.set_postfix({'loss': f'{loss_val:.4f}'})
         
-        # Handle remaining gradients if batch count not divisible
         if len(self.train_loader) % accumulation_steps != 0:
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -159,78 +168,56 @@ class SegmentationTrainer:
         
         return {
             'train_loss': avg_loss,
-            'lr': self.optimizer.param_groups[0]['lr'],
-            **{f'train_{k}': v / len(self.train_loader) for k, v in loss_components.items()}
+            'lr': self.optimizer.param_groups[0]['lr']
         }
 
-    
     def validate(self):
         """Validate on validation split."""
-        # self.ema.apply_shadow()
         self.model.eval()
-        checkpoint_enabled = False
-        if hasattr(self.model.backbone, 'gradient_checkpointing'):
-            checkpoint_enabled = self.model.backbone.gradient_checkpointing
-            self.model.backbone.gradient_checkpointing = False
-
         self.metrics.reset()
         total_loss = 0.0
-        all_keypoint_metrics = defaultdict(list)
         
         pbar = tqdm(self.val_loader, desc='Validation')
         with torch.no_grad():
-            for img, mask in pbar:
+            for img, heatmaps in pbar:
                 img = img.to(self.device, non_blocking=True)
-                mask = mask.squeeze(1).long().to(self.device, non_blocking=True)
+                heatmaps = heatmaps.to(self.device, non_blocking=True)
                 
                 with autocast(device_type='cuda'):
-                    seg_logits = self.model(img)
-                    loss, _ = self.criterion(seg_logits, mask)
+                    logits = self.model(img)
+                    loss = self.criterion(logits, heatmaps)
                 
                 total_loss += loss.item()
-                self.metrics.update(seg_logits, mask)
-                
-                kp_metrics = self.compute_keypoint_metrics(seg_logits, mask)
-                for key, val in kp_metrics.items():
-                    all_keypoint_metrics[key].append(val)
+                # Update metrics (Logits -> Sigmoid -> Coords)
+                self.metrics.update(logits, heatmaps)
         
         avg_loss = total_loss / len(self.val_loader)
         metrics_summary = self.metrics.get_summary()
         metrics_summary['val_loss'] = avg_loss
         
-        for key, values in all_keypoint_metrics.items():
-            metrics_summary[key] = np.mean(values)
-        
-        if hasattr(self.model.backbone, 'gradient_checkpointing'):
-            self.model.backbone.gradient_checkpointing = checkpoint_enabled
-
-        # self.ema.restore()
         return metrics_summary
         
     def save_checkpoint(self, epoch, metrics, is_best):
-        """Save latest checkpoint and best model based on mIoU."""
-        miou = metrics['mIoU']
+        """Save latest checkpoint and best model based on Mean PCK."""
+        pck = metrics.get('Mean_PCK', 0.0)
         
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_miou': self.best_miou,
+            'best_pck': self.best_pck,
             'metrics': metrics,
             'config': self.config
         }
         
-        # Always save latest checkpoint
         torch.save(checkpoint, self.checkpoint_dir / 'latest.pt')
         
-        # Save best checkpoint if this is the best mIoU so far
         if is_best:
             torch.save(checkpoint, self.checkpoint_dir / 'best.pt')
-            print(f"✓ Saved best checkpoint (mIoU: {miou:.4f})")
+            print(f"✓ Saved best checkpoint (PCK: {pck:.4f})")
     
     def train(self):
-        """Main training loop."""
         epochs = self.config.get('epochs', 50)
         
         for epoch in range(epochs):
@@ -238,89 +225,94 @@ class SegmentationTrainer:
             print(f"Epoch {epoch+1}/{epochs}")
             print(f"{'='*60}")
             
-            # Train
             train_metrics = self.train_epoch()
-            
-            # Validate
             val_metrics = self.validate()
-            
-            # Learning rate step
             self.scheduler.step()
             
             # Print summary
             print(f"Train Loss: {train_metrics['train_loss']:.4f}")
-            print(f"Components: {train_metrics}")
             print(f"Val Loss: {val_metrics['val_loss']:.4f}")
-            print(f"mIoU: {val_metrics['mIoU']:.4f} | mF1: {val_metrics['mF1']:.4f}")
-            for class_name in ['hole_1', 'hole_2', 'hole_3', 'hole_4', 'hole_5', 'center']:
-                print(f"  {class_name:12} - IoU: {val_metrics[f'{class_name}_IoU']:.4f}, "
-                    f"F1: {val_metrics[f'{class_name}_F1']:.4f}")
+            print(f"Mean PCK: {val_metrics['Mean_PCK']:.4f} | Mean Error: {val_metrics['Mean_Error']:.2f} px")
+            # Save history
+            self.history["epoch"].append(epoch)
+            self.history["train_loss"].append(train_metrics["train_loss"])
+            self.history["val_loss"].append(val_metrics["val_loss"])
+            self.history["mean_pck"].append(val_metrics.get("Mean_PCK", 0.0))
+            self.history["mean_error"].append(val_metrics.get("Mean_Error", 0.0))
             
-            is_best = val_metrics['mIoU'] > self.best_miou
+            # Print per-class metrics if available
+            for class_name in self.class_names:
+                pck_key = f"{class_name}_PCK"
+                mre_key = f"{class_name}_MRE"
+                self.class_history[class_name]["PCK"].append(val_metrics.get(pck_key, 0.0))
+                self.class_history[class_name]["MRE"].append(val_metrics.get(mre_key, 0.0))
+                if f'{class_name}_PCK' in val_metrics:
+                    print(f"  {class_name:12} - PCK: {val_metrics[f'{class_name}_PCK']:.4f}, "
+                          f"Err: {val_metrics[f'{class_name}_MRE']:.2f} px")
+            
+            # Early Stopping Check
+            current_pck = val_metrics.get('Mean_PCK', 0.0)
+            is_best = current_pck > self.best_pck
+            
             if is_best:
-                self.best_miou = val_metrics['mIoU']
+                self.best_pck = current_pck
                 self.best_epoch = epoch
                 self.patience_counter = 0
             else:
                 self.patience_counter += 1
-
-            # Save checkpoint (pass is_best flag to handle saving best.pt)
+            
             self.save_checkpoint(epoch, val_metrics, is_best)
             
-            # Early stopping check
-            if self.patience_counter >= self.patience:
-                print(f"\nEarly stopping triggered at epoch {epoch+1}")
-                print(f"Best mIoU: {self.best_miou:.4f} at epoch {self.best_epoch+1}")
-                break
-            
-            # Visualization
-            if (epoch + 1) % self.config.get('vis_frequency', 5) == 0:
+            if (epoch + 1) % self.config.get('vis_frequency', 10) == 0:
                 self.visualize_predictions(epoch)
             
-            # W&B logging
             if self.config.get('use_wandb', False):
                 wandb.log({**train_metrics, **val_metrics, 'epoch': epoch})
             
             self.val_metrics.append(val_metrics)
             
-            # Early stopping
             if self.patience_counter >= self.patience:
                 print(f"\nEarly stopping triggered at epoch {epoch+1}")
-                print(f"Best mIoU: {self.best_miou:.4f} at epoch {self.best_epoch+1}")
+                print(f"Best PCK: {self.best_pck:.4f} at epoch {self.best_epoch+1}")
                 break
         
+        self._save_history()
+        self._plot_curves()
         print(f"\nTraining complete!")
-        print(f"Best checkpoint: {self.checkpoint_dir / 'best.pt'} (mIoU: {self.best_miou:.4f})")
-        print(f"Latest checkpoint: {self.checkpoint_dir / 'latest.pt'}")
+        print(f"Best checkpoint: {self.checkpoint_dir / 'best.pt'}")
 
     def visualize_predictions(self, epoch):
-        """Save visualization samples during training."""
+        """Save visualization samples (Input, GT Heatmap, Pred Heatmap)."""
         self.model.eval()
-        
-        # Use first 4 validation samples
         vis_indices = self.val_indices[:4]
         
         fig, axes = plt.subplots(4, 3, figsize=(12, 16))
         
         with torch.no_grad():
             for idx, sample_idx in enumerate(vis_indices):
-                img, mask = self.dataset[sample_idx]
+                # Dataset returns img, heatmap
+                img, gt_heatmap = self.dataset[sample_idx] 
                 img_batch = img.unsqueeze(0).to(self.device)
                 
-                pred = self.model(img_batch)
-                pred_mask = pred.argmax(dim=1).squeeze().cpu()
+                logits = self.model(img_batch)
+                pred_heatmap = torch.sigmoid(logits).squeeze(0).cpu() # [C, H, W]
+                gt_heatmap = gt_heatmap.cpu() # [C, H, W]
+                
+                
+                gt_vis = torch.max(gt_heatmap, dim=0)[0]
+                pred_vis = torch.max(pred_heatmap, dim=0)[0]
                 
                 # Plot
                 axes[idx, 0].imshow(img.permute(1, 2, 0).cpu())
                 axes[idx, 0].set_title('Input')
                 axes[idx, 0].axis('off')
                 
-                axes[idx, 1].imshow(mask.squeeze().cpu(), cmap='tab10', vmin=0, vmax=5)
-                axes[idx, 1].set_title('Ground Truth')
+                axes[idx, 1].imshow(gt_vis, cmap='hot', vmin=0, vmax=1)
+                axes[idx, 1].set_title('GT Heatmap')
                 axes[idx, 1].axis('off')
                 
-                axes[idx, 2].imshow(pred_mask, cmap='tab10', vmin=0, vmax=5)
-                axes[idx, 2].set_title('Prediction')
+                axes[idx, 2].imshow(pred_vis, cmap='hot', vmin=0, vmax=1)
+                axes[idx, 2].set_title('Pred Heatmap')
                 axes[idx, 2].axis('off')
         
         plt.tight_layout()
@@ -331,61 +323,79 @@ class SegmentationTrainer:
         if self.config.get('use_wandb', False):
             wandb.log({"predictions": wandb.Image(str(save_path))}, step=epoch)
 
+    def _save_history(self):
+        """Save raw metrics history to JSON."""
+        hist_path = self.checkpoint_dir / "metrics_history.json"
+        # Convert numpy/torch types to Python native
+        history = {k: [float(v) for v in vals] for k, vals in self.history.items()}
+        class_history = {
+            name: {
+                "PCK": [float(v) for v in vals["PCK"]],
+                "MRE": [float(v) for v in vals["MRE"]],
+            }
+            for name, vals in self.class_history.items()
+        }
+        payload = {
+            "history": history,
+            "class_history": class_history,
+            "best_pck": float(self.best_pck),
+            "best_epoch": int(self.best_epoch),
+        }
+        with open(hist_path, "w") as f:
+            json.dump(payload, f, indent=2)
 
-    def compute_keypoint_metrics(self, predictions, targets):
-        """Compute detection rate and localization error for keypoints."""
-        pred_masks = predictions.argmax(dim=1)  # [B, H, W]
-        batch_size = pred_masks.shape[0]
-        num_classes = predictions.shape[1]
+    def _plot_curves(self):
+        """Generate and save loss/PCK/Error curves."""
+        epochs = self.history["epoch"]
+        if len(epochs) == 0:
+            return
         
-        metrics = {}
+        # 1) Loss curves
+        plt.figure(figsize=(6,4))
+        plt.plot(epochs, self.history["train_loss"], label="Train Loss")
+        plt.plot(epochs, self.history["val_loss"], label="Val Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        loss_path = self.checkpoint_dir / "loss_curves.png"
+        plt.savefig(loss_path, dpi=120)
+        plt.close()
         
-        # Vectorized computation per class
-        for class_id in range(1, num_classes):  # Skip background
-            # Get all masks at once
-            pred_mask = (pred_masks == class_id)  # [B, H, W]
-            gt_mask = (targets == class_id)  # [B, H, W]
-            
-            # Samples with GT keypoint present
-            has_gt = gt_mask.sum(dim=(1, 2)) > 0  # [B]
-            num_gt_samples = has_gt.sum().item()
-            
-            if num_gt_samples == 0:
-                continue
-            
-            # Detection: predicted where GT exists
-            has_pred = pred_mask.sum(dim=(1, 2)) > 0  # [B]
-            detected = (has_gt & has_pred).sum().item()
-            detection_rate = detected / num_gt_samples
-            
-            # Localization error (only for detected)
-            errors = []
-            for b in range(batch_size):
-                if not (has_gt[b] and has_pred[b]):
-                    continue
-                
-                # Compute centroids
-                pred_coords = torch.nonzero(pred_mask[b], as_tuple=False).float()
-                gt_coords = torch.nonzero(gt_mask[b], as_tuple=False).float()
-                
-                pred_centroid = pred_coords.mean(dim=0)  # [y, x]
-                gt_centroid = gt_coords.mean(dim=0)
-                
-                error = torch.dist(pred_centroid, gt_centroid).item()
-                errors.append(error)
-            
-            avg_error = np.mean(errors) if errors else 0.0
-            
-            metrics[f'kp{class_id}_detection_rate'] = detection_rate
-            metrics[f'kp{class_id}_error_px'] = avg_error
+        # 2) Mean PCK + per-class PCK
+        plt.figure(figsize=(7,5))
+        plt.plot(epochs, self.history["mean_pck"], label="Mean PCK", linewidth=2)
+        for name in self.class_names:
+            plt.plot(epochs, self.class_history[name]["PCK"], linestyle="--", alpha=0.6, label=f"{name}_PCK")
+        plt.xlabel("Epoch")
+        plt.ylabel("PCK")
+        plt.ylim(0, 1.0)
+        plt.legend(loc="best", fontsize=8)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        pck_path = self.checkpoint_dir / "pck_curves.png"
+        plt.savefig(pck_path, dpi=120)
+        plt.close()
         
-        # Convert to tensors for proper averaging
-        if metrics:
-            detection_rates = [v for k, v in metrics.items() if 'detection' in k]
-            errors = [v for k, v in metrics.items() if 'error' in k and v > 0]
-            
-            metrics['avg_detection_rate'] = np.mean(detection_rates)
-            metrics['avg_localization_error_px'] = np.mean(errors) if errors else 0.0
+        # 3) Mean Error + per-class MRE
+        plt.figure(figsize=(7,5))
+        plt.plot(epochs, self.history["mean_error"], label="Mean Error", linewidth=2)
+        for name in self.class_names:
+            plt.plot(epochs, self.class_history[name]["MRE"], linestyle="--", alpha=0.6, label=f"{name}_MRE")
+        plt.xlabel("Epoch")
+        plt.ylabel("Error (px)")
+        plt.legend(loc="best", fontsize=8)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        err_path = self.checkpoint_dir / "error_curves.png"
+        plt.savefig(err_path, dpi=120)
+        plt.close()
         
-        return metrics
-
+        # Optional: log to W&B
+        if self.config.get("use_wandb", False):
+            wandb.log({
+                "plots/loss_curves": wandb.Image(str(loss_path)),
+                "plots/pck_curves": wandb.Image(str(pck_path)),
+                "plots/error_curves": wandb.Image(str(err_path)),
+            }, step=len(epochs)-1)

@@ -30,7 +30,7 @@ class InterfaceDetector:
         self.conf_threshold = conf_threshold
         self.half = half
         self.mask_mode = mask_mode
-        self.crop_Size = crop_size
+        self.crop_size = crop_size
         # Load YOLO model
         weights_path = Path(weights_path)
         if not weights_path.exists():
@@ -46,14 +46,13 @@ class InterfaceDetector:
         else:
             print(f"Model loaded on {self.device}")
     
-    def forward(self, image, crop_size=512, debug=False):
+    def forward(self, image, debug=False):
         """
         Process image(s) through YOLO and extract cropped, masked objects.
         
         Args:
             image (torch.Tensor): Input image(s)
                   Expected shape [B, C, H, W] or [C, H, W] with values in [0, 1] or [0, 255]
-            crop_size (int): Size of the output square crop (default: 512)
         
         Returns:
             torch.Tensor: Cropped and masked images [B, C, crop_size, crop_size]
@@ -110,7 +109,7 @@ class InterfaceDetector:
                 batch_masks.append(mask)
                 continue
             # Calculate crop boundaries centered at center of mass
-            half_size = crop_size // 2
+            half_size = self.crop_size // 2
             
             # Determine crop region with bounds checking
             crop_y1 = max(0, com_y - half_size)
@@ -145,8 +144,8 @@ class InterfaceDetector:
                 ).squeeze(0).squeeze(0)  # [H, W]
             
             # Ensure exact size
-            cropped_img = cropped_img[:, :crop_size, :crop_size].to(self.device)
-            cropped_mask = cropped_mask[:crop_size, :crop_size].to(self.device)
+            cropped_img = cropped_img[:, :self.crop_size, :self.crop_size].to(self.device)
+            cropped_mask = cropped_mask[:self.crop_size, :self.crop_size].to(self.device)
             
             # Zero out background pixels (where mask == 0)
             cropped_mask_3ch = cropped_mask.unsqueeze(0)  # [1, H, W] - broadcast to channels
@@ -170,6 +169,6 @@ class InterfaceDetector:
         
         return output_tensor, batch_centers
     
-    def __call__(self, image, crop_size=512, debug=False):
+    def __call__(self, image, debug=False):
         """Allow calling the detector directly"""
-        return self.forward(image, crop_size,debug)
+        return self.forward(image,debug)

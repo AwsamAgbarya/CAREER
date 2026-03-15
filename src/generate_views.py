@@ -10,6 +10,9 @@ import json
 import argparse
 import glob
 from tqdm import tqdm 
+from scipy.interpolate import CubicSpline
+import cv2
+from pathlib import Path
 
 '''
 Example usage:
@@ -33,18 +36,70 @@ def parse_args():
     parser.add_argument("--focal", type=float, default=800.0, help="Focal length.")
     parser.add_argument("--near", type=float, default=0.01, help="Near plane.")
     parser.add_argument("--far", type=float, default=100.0, help="Far plane.")
-    parser.add_argument("--num_views", type=int, default=2000, help="TOTAL number of views (Train + Test).")
-    parser.add_argument("--train_split", type=float, default=0.8, help="Ratio of training data.")
-    parser.add_argument("--radius_range", type=tuple, default=(5.0,15.0), help="Radius range.")
+    parser.add_argument("--num_views_train", type=int, default=0, help="Number of views Train.")
+    parser.add_argument("--num_views_test", type=int, default=500, help="Number of views Test.")
+    parser.add_argument("--radius_range", type=tuple, default=(5.0,12.0), help="Radius range.")
     parser.add_argument("--theta_range", type=tuple, default=(125,180), help="Theta range.")
-    parser.add_argument("--stereo_test", action='store_true', help="Use stereo pairs for test set.")
     parser.add_argument("--baseline", type=float, default=1.0, help="Stereo baseline (meters).")
     parser.add_argument("--object_rot_range", type=float, default=359.0, help="Max rotation (degrees) of the object around Z-axis for TEST data (e.g. 360 for full spin).")
+
+    parser.add_argument("--stereo_test", action='store_true', help="Use stereo pairs for test set.")
+    parser.add_argument("--num_keypoints", type=int, default=8, help="Number of keypoints to interpolate for test video trajectory")
+    parser.add_argument("--min_segment_len", type=int, default=20)
+    parser.add_argument("--max_segment_len", type=int, default=70)
+    parser.add_argument("--speed_range_deg", type=tuple, default=(2.0, 4.0))
+    parser.add_argument("--smooth_transition_frames", type=int, default=5)
 
     args = parser.parse_args()
     return args
 
 
+def frames_to_video(frame_dir, output_name = "output.mp4", fps = 24,pattern = "*_rgb.jpeg"):
+    """
+    Compile rendered frames from a directory into an MP4 video.
+    """
+    left_dir = os.path.join(frame_dir, "left")
+    right_dir = os.path.join(frame_dir, "right")
+
+    left_paths  = sorted(Path(left_dir).glob(pattern))
+    right_paths = sorted(Path(right_dir).glob(pattern))
+
+    assert len(left_paths) > 0,  f"No frames found in {left_dir}"
+    assert len(right_paths) > 0, f"No frames found in {right_dir}"
+    assert len(left_paths) == len(right_paths), \
+        f"Frame count mismatch: {len(left_paths)} left vs {len(right_paths)} right"
+
+    output_path = os.path.join(frame_dir, output_name)
+
+    first = cv2.imread(str(left_paths[0]))
+    H, W = first.shape[:2]
+
+    writer = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (W * 2, H)
+    )
+
+    for left_p, right_p in zip(left_paths, right_paths):
+        left_frame  = cv2.imread(str(left_p))
+        right_frame = cv2.imread(str(right_p))
+        composite   = np.concatenate([left_frame, right_frame], axis=1)  # hstack
+        writer.write(composite)
+
+    writer.release()
+    print(f"Saved stereo video to {output_path} ({len(left_paths)} frames @ {fps} fps)")
+
+def load_keypoint_3d_centers(json_path: str) -> np.ndarray:
+    """
+    Load keypoint 3D centers from JSON and return as ordered (N, 3) numpy array.
+    """
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    sorted_ids = sorted(data.keys(), key=lambda k: int(k))
+    centers = np.array([[data[k]["x"], data[k]["y"], data[k]["z"]] for k in sorted_ids], dtype=np.float32)
+    return centers
 
 def load_ply(path, keypoint_id, device="cuda"):
     """
@@ -252,6 +307,75 @@ def look_at(camera_pos, target, up_axis='y'):
     
     return view_mats
 
+def random_trajectory_bottom_cone(num_views, num_keypoints = 8, radius_range = (3.0, 5.0), theta_range_deg = (125, 180)):
+    """
+    Generate smooth temporal camera trajectories within a spherical cone constraint using a cubic spline between keypoints.
+
+    Args:
+        num_views (int):       Number of output frames.
+        num_keypoints (int):   Number of random anchors to spline through.
+        radius_range (tuple):  (min_radius, max_radius) for camera distance.
+        theta_range_deg (tuple): (min_theta, max_theta) polar angle in degrees.
+    Returns:
+        Tensor: (num_views, 4, 4) view matrices (world-to-camera).
+    """
+    azimuth_kp = np.random.uniform(0, 2 * np.pi, num_keypoints)
+
+    theta_min_rad = np.deg2rad(theta_range_deg[0])
+    theta_max_rad = np.deg2rad(theta_range_deg[1])
+    cos_max = np.cos(theta_min_rad)
+    cos_min = np.cos(theta_max_rad)
+    cos_theta_kp = np.random.uniform(cos_min, cos_max, num_keypoints)
+    sin_theta_kp = np.sqrt(np.clip(1.0 - cos_theta_kp ** 2, 0, None))
+
+    r_min, r_max = radius_range
+    radius_kp = np.random.uniform(r_min, r_max, num_keypoints)
+
+    x_kp = radius_kp * sin_theta_kp * np.cos(azimuth_kp)
+    y_kp = radius_kp * sin_theta_kp * np.sin(azimuth_kp)
+    z_kp = radius_kp * cos_theta_kp
+    positions_kp = np.stack([x_kp, y_kp, z_kp], axis=-1)
+
+    # Parameterize keypoints by arc-length approximation (chord length)nThis gives more uniform speed along the path vs. uniform t spacing.
+    deltas = np.diff(positions_kp, axis=0)
+    chord_lengths = np.linalg.norm(deltas, axis=-1)
+    t_kp = np.concatenate([[0.0], np.cumsum(chord_lengths)])
+    t_kp /= t_kp[-1]  # normalize to [0, 1]
+
+    cs_x = CubicSpline(t_kp, positions_kp[:, 0])
+    cs_y = CubicSpline(t_kp, positions_kp[:, 1])
+    cs_z = CubicSpline(t_kp, positions_kp[:, 2])
+
+    t_frames = np.linspace(0.0, 1.0, num_views, endpoint=True)
+    x_frames = cs_x(t_frames)
+    y_frames = cs_y(t_frames)
+    z_frames = cs_z(t_frames)
+
+    # clamp positions back into cone bounds
+    cam_positions = np.stack([x_frames, y_frames, z_frames], axis=-1)
+
+    radii = np.linalg.norm(cam_positions, axis=-1, keepdims=True)
+    directions = cam_positions / (radii + 1e-8)
+    clamped_radii = np.clip(radii, r_min, r_max)
+    cos_theta_frames = directions[:, 2:3]
+    cos_theta_clamped = np.clip(cos_theta_frames, cos_min, cos_max)
+
+    # Reconstruct directions with clamped theta (preserve azimuth, adjust z)
+    xy_norm = np.linalg.norm(directions[:, :2], axis=-1, keepdims=True) + 1e-8
+    sin_theta_clamped = np.sqrt(np.clip(1.0 - cos_theta_clamped ** 2, 0, None))
+    xy_dir = directions[:, :2] / xy_norm
+    clamped_dirs = np.concatenate([
+        xy_dir * sin_theta_clamped,
+        cos_theta_clamped
+    ], axis=-1)
+
+    cam_positions = clamped_dirs * clamped_radii
+
+    # Build view matrices
+    cam_pos_torch = torch.from_numpy(cam_positions).float()
+    target = torch.zeros_like(cam_pos_torch)
+
+    return look_at(cam_pos_torch, target, up_axis='y')
 
 def random_view_bottom_cone(num_views, radius_range=(3.0, 5.0), theta_range_deg=(180, 180)):
     """
@@ -281,6 +405,54 @@ def random_view_bottom_cone(num_views, radius_range=(3.0, 5.0), theta_range_deg=
     
     return look_at(camera_pos, target, up_axis='y')
 
+def random_smooth_rotation_angles(num_views, rot_range_deg = 360.0, min_segment_len = 10, max_segment_len = 40, speed_range_deg = (1.0, 5.0), smooth_transition_frames = 5):
+    """
+    Generate N smooth rotation angles simulating realistic object rotation in video.
+
+    Args:
+        num_views (int):               Total number of frames / angle samples.
+        rot_range_deg (float):         Max absolute rotation in degrees.
+        min_segment_len (int):         Minimum frames per directional segment.
+        max_segment_len (int):         Maximum frames per directional segment.
+        speed_range_deg (tuple):       (min, max) angular speed in degrees/frame.
+        smooth_transition_frames (int): Number of frames used to blend speed at direction changes (cosine ease in/out).
+
+    Returns:
+        np.ndarray: (num_views,) array of rotation angles in degrees.
+    """
+    angular_velocity = np.zeros(num_views)
+    frame = 0
+    current_dir = np.random.choice([-1, 1])
+
+    while frame < num_views:
+        # Sample segment length and speed
+        seg_len = np.random.randint(min_segment_len, max_segment_len + 1)
+        seg_len = min(seg_len, num_views - frame)
+        speed = np.random.uniform(*speed_range_deg)
+
+        # Fill the segment with constant angular velocity
+        angular_velocity[frame:frame + seg_len] = current_dir * speed
+
+        # Smooth the transition zone around the boundary
+        t = min(smooth_transition_frames, seg_len // 2)
+        if t > 0:
+            ramp_out = np.array([0.5 * (1 + np.cos(np.pi * k / t)) for k in range(t)])
+            end_start = frame + seg_len - t
+            angular_velocity[end_start:frame + seg_len] *= ramp_out[::-1]
+            if frame > 0:
+                ramp_in = np.array([0.5 * (1 - np.cos(np.pi * k / t)) for k in range(t)])
+                angular_velocity[frame:frame + t] *= ramp_in
+
+        frame += seg_len
+        current_dir *= -1
+
+    # Integrate velocity → cumulative angle
+    angles = np.cumsum(angular_velocity)
+    # Clip to [-rot_range_deg, +rot_range_deg]
+    angles = np.clip(angles, -rot_range_deg, rot_range_deg)
+
+    return angles
+
 def tensor_to_list(tensor):
     if isinstance(tensor, torch.Tensor):
         return tensor.cpu().numpy().tolist()
@@ -298,7 +470,7 @@ def get_z_rotation_matrix(angle_deg, device='cuda'):
         [0,  0, 1]
     ], device=device, dtype=torch.float32)
 
-def generate_stereo_cameras_rigid(num_pairs, baseline, radius_range, theta_range_deg, rot_angles=None):
+def generate_stereo_cameras_rigid(num_pairs, baseline, radius_range, theta_range_deg, rot_angles=None, num_keypoints=8):
     """
     Generates RIGID stereo camera pairs (Parallel axes) with optional Z-axis orbit (object rotation simulation).
     Args:
@@ -306,7 +478,7 @@ def generate_stereo_cameras_rigid(num_pairs, baseline, radius_range, theta_range
                     If provided, orbits the camera by -angle around Z.
     """
     # Generate base Center views
-    center_views_w2c = random_view_bottom_cone(num_pairs, radius_range, theta_range_deg)
+    center_views_w2c = random_trajectory_bottom_cone(num_pairs, num_keypoints, radius_range, theta_range_deg)
     
     left_views = []
     right_views = []
@@ -349,6 +521,58 @@ def generate_stereo_cameras_rigid(num_pairs, baseline, radius_range, theta_range
         
     return torch.stack(left_views), torch.stack(right_views)
 
+def extract_keypoint_3d_centers(keypoint_dir, output_json_path, baseline, focal, H, W, weight_by_opacity = True):
+    """
+    Extract the 3D center of mass for each keypoint PLY file and save to JSON.
+    """
+    keypoint_files = sorted(glob.glob(os.path.join(keypoint_dir, "*.ply")))
+    
+    if len(keypoint_files) == 0:
+        raise FileNotFoundError(f"No PLY files found in: {keypoint_dir}")
+
+    keypoint_centers = {}
+
+    for kp_file in keypoint_files:
+        filename = os.path.basename(kp_file)
+        kp_id = int(os.path.splitext(filename)[0])
+
+        plydata = PlyData.read(kp_file)
+        v = plydata["vertex"]
+
+        # 3D Gaussian centers — shape (N, 3)
+        centers = np.stack([v["x"], v["y"], v["z"]], axis=-1).astype(np.float64)
+
+        if weight_by_opacity:
+            # Sigmoid to convert raw logit opacity to [0, 1]
+            raw_opacity = np.array(v["opacity"], dtype=np.float64)
+            weights = 1.0 / (1.0 + np.exp(-raw_opacity))
+            weights = weights / weights.sum()
+            center_3d = (centers * weights[:, None]).sum(axis=0)
+        else:
+            center_3d = centers.mean(axis=0)
+
+        keypoint_centers[str(kp_id)] = {
+            "x": float(center_3d[0]),
+            "y": float(center_3d[1]),
+            "z": float(center_3d[2]),
+        }
+        print(f"  Keypoint {kp_id:>3d}: ({center_3d[0]:+.6f}, {center_3d[1]:+.6f}, {center_3d[2]:+.6f})")
+    
+
+    keypoint_centers["baseline_rotation"] = [[1,0,0],[0,1,0],[0,0,1]]
+    keypoint_centers["l2r_baseline_translation"] = [-baseline,0,0]
+    keypoint_centers["baseline"] = baseline
+    keypoint_centers['focal'] = focal
+    keypoint_centers['H'] = H
+    keypoint_centers['W'] = W
+    # Save to JSON
+    with open(output_json_path, "w") as f:
+        json.dump(keypoint_centers, f, indent=2)
+
+    print(f"\nSaved {len(keypoint_centers)} keypoint centers to: {output_json_path}")
+    return keypoint_centers
+
+
 if __name__ == "__main__":
     args = parse_args()
     base_ply = args.base_ply
@@ -365,7 +589,7 @@ if __name__ == "__main__":
     if args.stereo_test:
         os.makedirs(test_dir_left, exist_ok=True)
         os.makedirs(test_dir_right, exist_ok=True)
-        os.makedirs(os.path.join(out_dir, "left_right_poses"), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, "meta_data"), exist_ok=True)
     else:
         os.makedirs(test_dir_single, exist_ok=True)
     
@@ -373,11 +597,12 @@ if __name__ == "__main__":
     focal, near, far = args.focal, args.near, args.far
 
     # Calculate Split
-    num_total = args.num_views
-    num_train = int(num_total * args.train_split)
-    num_test = num_total - num_train
+    num_train = args.num_views_train
+    num_test = args.num_views_test
     
-    print(f"Total: {num_total} | Train: {num_train} | Test: {num_test}")
+    print(f"Train: {num_train} | Test: {num_test}")
+    # 3D coordinates
+    extract_keypoint_3d_centers(keypoint_ply, os.path.join(out_dir, "meta_data", "object_keypoints.json"), args.baseline, focal, H, W)
 
     # TRAIN GENERATION
     print("Generating Training Data...")
@@ -417,8 +642,16 @@ if __name__ == "__main__":
     print(f"Generating Test Data ({'Stereo' if args.stereo_test else 'Mono'})...")
 
     rot_angles = np.random.uniform(-args.object_rot_range, args.object_rot_range, num_test)
+    rot_angles = random_smooth_rotation_angles(
+        num_views=num_test, 
+        rot_range_deg=args.object_rot_range, 
+        min_segment_len=args.min_segment_len, 
+        max_segment_len=args.max_segment_len, 
+        speed_range_deg=args.speed_range_deg,
+        smooth_transition_frames=args.smooth_transition_frames
+        )
     if args.stereo_test:
-        left_views, right_views = generate_stereo_cameras_rigid(num_test, args.baseline, args.radius_range, args.theta_range, rot_angles=rot_angles)
+        left_views, right_views = generate_stereo_cameras_rigid(num_test, args.baseline, args.radius_range, args.theta_range, rot_angles=rot_angles, num_keypoints=args.num_keypoints)
         
         for i in tqdm(range(num_test), desc="Testing"):
             rot_deg = rot_angles[i]
@@ -451,13 +684,13 @@ if __name__ == "__main__":
                 "right_file": f"view_{i:04d}_rgb.jpeg",
                 "c2w_left": tensor_to_list(c2w_left),
                 "c2w_right": tensor_to_list(c2w_right),
+                "left_w2c": tensor_to_list(left_views[i]),
                 "object_rotation_z_deg": float(rot_deg),
-                "object_rotation_matrix": get_z_rotation_matrix(rot_deg).cpu().numpy().tolist(),
-                "baseline": args.baseline,
-                "fl_x": focal, "fl_y": focal, "cx": W/2, "cy": H/2, "w": W, "h": H
+                "object_rotation_matrix": get_z_rotation_matrix(rot_deg).cpu().numpy().tolist()
             }
-            with open(os.path.join(out_dir, "left_right_poses", f"pair_{i:04d}_params.json"), 'w') as f:
+            with open(os.path.join(out_dir, "meta_data", f"pair_{i:04d}_params.json"), 'w') as f:
                 json.dump(params, f, indent=4)
+        frames_to_video(os.path.join(out_dir, "test"))
                 
     else:
         test_views = random_view_bottom_cone(num_test, args.radius_range, args.theta_range)
@@ -477,7 +710,6 @@ if __name__ == "__main__":
                 "c2w": tensor_to_list(c2w),
                 "object_rotation_z_deg": float(rot_deg),
                 "object_rotation_matrix": tensor_to_list(R_obj),
-                "fl_x": focal, "fl_y": focal, "cx": W/2, "cy": H/2, "w": W, "h": H
             }
             with open(os.path.join(test_dir_single, f"pair_{i:04d}_params.json"), 'w') as f:
                 json.dump(params, f, indent=4)
