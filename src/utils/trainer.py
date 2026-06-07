@@ -39,8 +39,12 @@ class KeypointTrainer:
 
         # Loss function - Adaptive Wing Loss for Heatmaps
         self.criterion = HeatmapAWingMSE(
+            sigma=config.get('sigma', 3.0),
             wing_weight=config.get('w_weight', 2.1),
             mse_weight=config.get('mse_weight', 2.1),
+            cross_weight=config.get('cross_weight', 2.1),
+            sharp_weight=config.get('sharp_weight', 2.1),
+            distance_factor=config.get('distance_factor', 2.1),
             alpha=config.get('alpha', 2.1),
             omega=config.get('omega', 14.0),
             epsilon=config.get('epsilon', 1.0),
@@ -88,6 +92,12 @@ class KeypointTrainer:
             "mean_pck": [],
             "mean_error": [],
         }
+        self.loss_keys = getattr(self.criterion, 'loss_keys', [])
+
+        for k in self.loss_keys:
+            self.history[f'train_{k}'] = []
+            self.history[f'val_{k}']   = []
+
         # Per-class histories (dict of name -> list)
         self.class_history = {
             name: {"PCK": [], "MRE": []}
@@ -130,71 +140,77 @@ class KeypointTrainer:
     def train_epoch(self):
         self.model.train()
         total_loss = 0.0
+        sub_totals = {k: 0.0 for k in self.loss_keys}
         accumulation_steps = self.config.get('accumulation_steps', 1)
-        
+
         pbar = tqdm(self.train_loader, desc='Training')
         for batch_idx, (img, heatmaps) in enumerate(pbar):
-            img = img.to(self.device, non_blocking=True)
-            # heatmaps are [B, C, H, W] float tensors
+            img     = img.to(self.device, non_blocking=True)
             heatmaps = heatmaps.to(self.device, non_blocking=True)
 
-            # Forward + backward
             with autocast(device_type='cuda'):
-                logits = self.model(img) # [B, C, H, W] logits
-                loss = self.criterion(logits, heatmaps)
-                loss = loss / accumulation_steps
-            
+                logits    = self.model(img)
+                loss_dict = self.criterion(logits, heatmaps)
+                loss      = loss_dict['total'] / accumulation_steps
+
             self.scaler.scale(loss).backward()
-            
-            # Update weights
+
             if (batch_idx + 1) % accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad()
-            
+
             loss_val = loss.item() * accumulation_steps
-            total_loss += loss_val 
+            total_loss += loss_val
+            for k in self.loss_keys:
+                sub_totals[k] += loss_dict[k].item()
+
             pbar.set_postfix({'loss': f'{loss_val:.4f}'})
-        
+
         if len(self.train_loader) % accumulation_steps != 0:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad()
-        
-        avg_loss = total_loss / len(self.train_loader)
+
+        n = len(self.train_loader)
+        avg_loss = total_loss / n
         self.train_losses.append(avg_loss)
-        
+
         return {
             'train_loss': avg_loss,
-            'lr': self.optimizer.param_groups[0]['lr']
+            'lr': self.optimizer.param_groups[0]['lr'],
+            **{f'train_{k}': sub_totals[k] / n for k in self.loss_keys},
         }
 
     def validate(self):
-        """Validate on validation split."""
         self.model.eval()
         self.metrics.reset()
         total_loss = 0.0
-        
+        sub_totals = {k: 0.0 for k in self.loss_keys}
+
         pbar = tqdm(self.val_loader, desc='Validation')
         with torch.no_grad():
             for img, heatmaps in pbar:
-                img = img.to(self.device, non_blocking=True)
+                img      = img.to(self.device, non_blocking=True)
                 heatmaps = heatmaps.to(self.device, non_blocking=True)
-                
+
                 with autocast(device_type='cuda'):
-                    logits = self.model(img)
-                    loss = self.criterion(logits, heatmaps)
-                
-                total_loss += loss.item()
-                # Update metrics (Logits -> Sigmoid -> Coords)
+                    logits    = self.model(img)
+                    loss_dict = self.criterion(logits, heatmaps)
+
+                total_loss += loss_dict['total'].item()
+                for k in self.loss_keys:
+                    sub_totals[k] += loss_dict[k].item()
                 self.metrics.update(logits, heatmaps)
-        
-        avg_loss = total_loss / len(self.val_loader)
+
+        n = len(self.val_loader)
         metrics_summary = self.metrics.get_summary()
-        metrics_summary['val_loss'] = avg_loss
-        
+        metrics_summary['val_loss'] = total_loss / n
+        for k in self.loss_keys:
+            metrics_summary[f'val_{k}'] = sub_totals[k] / n
+
         return metrics_summary
         
     def save_checkpoint(self, epoch, metrics, is_best):
@@ -239,6 +255,9 @@ class KeypointTrainer:
             self.history["val_loss"].append(val_metrics["val_loss"])
             self.history["mean_pck"].append(val_metrics.get("Mean_PCK", 0.0))
             self.history["mean_error"].append(val_metrics.get("Mean_Error", 0.0))
+            for k in self.loss_keys:
+                self.history[f'train_{k}'].append(train_metrics.get(f'train_{k}', 0.0))
+                self.history[f'val_{k}'].append(val_metrics.get(f'val_{k}', 0.0))
             
             # Print per-class metrics if available
             for class_name in self.class_names:
@@ -294,8 +313,7 @@ class KeypointTrainer:
                 img, gt_heatmap = self.dataset[sample_idx] 
                 img_batch = img.unsqueeze(0).to(self.device)
                 
-                logits = self.model(img_batch)
-                pred_heatmap = torch.sigmoid(logits).squeeze(0).cpu() # [C, H, W]
+                pred_heatmap = self.model(img_batch).squeeze(0).cpu()
                 gt_heatmap = gt_heatmap.cpu() # [C, H, W]
                 
                 
@@ -391,6 +409,41 @@ class KeypointTrainer:
         err_path = self.checkpoint_dir / "error_curves.png"
         plt.savefig(err_path, dpi=120)
         plt.close()
+
+        # 4) Sub-loss components (train vs val)
+        loss_labels = {
+            'awing': 'AWing Loss',
+            'mse':   'MSE Loss',
+            'cross': 'Cross-Channel Loss',
+            'sharp': 'Sharpness Loss',
+        }
+        n_keys = len(self.loss_keys)
+        if n_keys > 0:
+            cols = 2
+            rows = (n_keys + 1) // cols
+            fig, axes = plt.subplots(rows, cols, figsize=(10, 4 * rows))
+            axes = axes.flat if n_keys > 1 else [axes]
+
+            for ax, k in zip(axes, self.loss_keys):
+                ax.plot(epochs, self.history[f'train_{k}'], label='Train')
+                ax.plot(epochs, self.history[f'val_{k}'],   label='Val', linestyle='--')
+                ax.set_title(loss_labels.get(k, k))
+                ax.set_xlabel('Epoch')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+
+            # Hide any unused subplot panels
+            for ax in list(axes)[n_keys:]:
+                ax.set_visible(False)
+
+            plt.tight_layout()
+            sub_path = self.checkpoint_dir / "sub_loss_curves.png"
+            plt.savefig(sub_path, dpi=120)
+            plt.close()
+
+            if self.config.get("use_wandb", False):
+                wandb.log({"plots/sub_loss_curves": wandb.Image(str(sub_path))},
+                        step=len(epochs) - 1)
         
         # Optional: log to W&B
         if self.config.get("use_wandb", False):

@@ -79,4 +79,4 @@ class VmambaSegmentor(nn.Module):
     def forward(self, x):
         features = self.backbone(x)  # Multi-scale features
         seg_logits = self.seg_head(features)  # Already at input resolution
-        return seg_logits  # Shape: [B, num_classes, H, W]
+        return torch.sigmoid(seg_logits)  # Shape: [B, num_classes, H, W]

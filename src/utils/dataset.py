@@ -12,7 +12,7 @@ import kornia.morphology as morph
 from tqdm import tqdm
 
 class KeypointDataset(Dataset):
-    def __init__(self, data_directory, crop_size=(128,128), background_directory=None, mode="segment_six",  sigma=3.0, H=720, W=1280, max_N = None):
+    def __init__(self, data_directory, crop_size=(256,256), background_directory=None, mode="segment_all",  sigma=3.0, H=720, W=1280, max_N = None):
         
         self.data_directory = data_directory
         self.N = len(os.listdir(data_directory))//4 if max_N is None else max_N
@@ -34,11 +34,11 @@ class KeypointDataset(Dataset):
         
         # Setup class remapping
         if mode == "segment_six":
-            self.accepted_classes = torch.tensor([3,5,7,8,10,12], dtype=torch.long).to(device)
+            self.accepted_classes = torch.tensor([4,6,8,9,11,13], dtype=torch.long).to(device)
             self.map_index = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.long).to(device)
             self.num_classes = 6
         elif mode == "segment_all":
-            self.accepted_classes = torch.tensor([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], dtype=torch.long).to(device)
+            self.accepted_classes = torch.tensor([3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], dtype=torch.long).to(device)
             self.map_index = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], dtype=torch.long).to(device)
             self.num_classes = 11
         else:
@@ -49,12 +49,12 @@ class KeypointDataset(Dataset):
         self.images = torch.zeros((self.N, 3, crop_size[0], crop_size[1]), dtype=torch.float32)
         self.heatmaps = torch.zeros((self.N, self.num_classes, crop_size[0], crop_size[1]), dtype=torch.float32)
         self.masks = torch.zeros((self.N, 1, crop_size[0], crop_size[1]), dtype=torch.float32)
-        
+
         for idx_orig in tqdm(range(self.N), desc="GPU preprocessing"):
             prefix = os.path.join(self.data_directory, f"view_{idx_orig:05d}")
             img = pil_to_tensor(Image.open(f"{prefix}_rgb.jpeg").convert("RGB")).float().to(device) / 255.0
             mask = pil_to_tensor(Image.open(f"{prefix}_mask.png")).to(device)
-            
+
             # Background
             if len(self.backgrounds) > 0:
                 bg = self.backgrounds[np.random.randint(len(self.backgrounds))]

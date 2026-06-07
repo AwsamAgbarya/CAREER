@@ -17,8 +17,7 @@ from pathlib import Path
 '''
 Example usage:
 Conda activate gsplat
-python ./src/generate_views.py --num_views 2000 --base_ply ./splats/interface.ply --keypoint_dir ./splats/keypoints/ --out_dir ./renders
-
+python ./src/generate_views.py --stereo_test
 Expects an object interface.ply and a keypoint directory such that each keypoint is saved in one separate file, named as an integer according to its class (+1 for technicality, i.e 1.ply keypoint file = class 2)
 
 For more customization pease look at parse_args() function
@@ -28,7 +27,7 @@ For more customization pease look at parse_args() function
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Render random views from a Gaussian Splatting scene.")
-    parser.add_argument("--base_ply", type=str, default="./splats/interface.ply", help="Path to base PLY.")
+    parser.add_argument("--base_ply", type=str, default="./splats/", help="Path to base PLY.")
     parser.add_argument("--keypoint_dir", type=str, default="./splats/keypoints", help="Path to keypoints.")
     parser.add_argument("--out_dir", type=str, default="./renders", help="Output directory.")
     parser.add_argument("--height", type=int, default=720, help="Image height.")
@@ -36,7 +35,7 @@ def parse_args():
     parser.add_argument("--focal", type=float, default=800.0, help="Focal length.")
     parser.add_argument("--near", type=float, default=0.01, help="Near plane.")
     parser.add_argument("--far", type=float, default=100.0, help="Far plane.")
-    parser.add_argument("--num_views_train", type=int, default=0, help="Number of views Train.")
+    parser.add_argument("--num_views_train", type=int, default=2000, help="Number of views Train.")
     parser.add_argument("--num_views_test", type=int, default=500, help="Number of views Test.")
     parser.add_argument("--radius_range", type=tuple, default=(5.0,12.0), help="Radius range.")
     parser.add_argument("--theta_range", type=tuple, default=(125,180), help="Theta range.")
@@ -162,7 +161,14 @@ def render_image(
     # Load object (keypoint_id=0)
     means_list, scales_list, quats_list, rgbs_list, ops_list, kp_ids_list = [], [], [], [], [], []
     
-    means_obj, scales_obj, quats_obj, rgbs_obj, ops_obj, kp_ids_obj = load_ply(ply_object_path, 1, device)
+    means_obj, scales_obj, quats_obj, rgbs_obj, ops_obj, kp_ids_obj = load_ply(os.path.join(ply_object_path, "interface.ply"), 1, device)
+    means_list.append(means_obj)
+    scales_list.append(scales_obj)
+    quats_list.append(quats_obj)
+    rgbs_list.append(rgbs_obj)
+    ops_list.append(ops_obj)
+    kp_ids_list.append(kp_ids_obj)
+    means_obj, scales_obj, quats_obj, rgbs_obj, ops_obj, kp_ids_obj = load_ply(os.path.join(ply_object_path, "front.ply"), 2, device)
     means_list.append(means_obj)
     scales_list.append(scales_obj)
     quats_list.append(quats_obj)
@@ -173,12 +179,12 @@ def render_image(
     # Load all numbered keypoint files
     keypoint_files = sorted(glob.glob(os.path.join(keypoint_dir, "*.ply")))
     num_keypoints = len(keypoint_files)
-    num_classes = num_keypoints + 2
+    num_classes = num_keypoints + 3
     
     for kp_file in keypoint_files:
         # Extract keypoint number from filename (e.g., "1.ply" -> 1)
         filename = os.path.basename(kp_file)
-        kp_num = int(os.path.splitext(filename)[0])+1
+        kp_num = int(os.path.splitext(filename)[0])+2
         
         means_kp, scales_kp, quats_kp, rgbs_kp, ops_kp, kp_ids_kp = load_ply(kp_file, kp_num, device)
         means_list.append(means_kp)
@@ -556,7 +562,6 @@ def extract_keypoint_3d_centers(keypoint_dir, output_json_path, baseline, focal,
             "y": float(center_3d[1]),
             "z": float(center_3d[2]),
         }
-        print(f"  Keypoint {kp_id:>3d}: ({center_3d[0]:+.6f}, {center_3d[1]:+.6f}, {center_3d[2]:+.6f})")
     
 
     keypoint_centers["baseline_rotation"] = [[1,0,0],[0,1,0],[0,0,1]]
@@ -602,6 +607,7 @@ if __name__ == "__main__":
     
     print(f"Train: {num_train} | Test: {num_test}")
     # 3D coordinates
+    os.makedirs(os.path.join(out_dir, "meta_data"), exist_ok=True)
     extract_keypoint_3d_centers(keypoint_ply, os.path.join(out_dir, "meta_data", "object_keypoints.json"), args.baseline, focal, H, W)
 
     # TRAIN GENERATION

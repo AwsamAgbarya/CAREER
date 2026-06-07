@@ -29,15 +29,14 @@ def parse_args():
     # Data
     parser.add_argument('--data-dir', default='./renders/train/', help='Training data directory')
     parser.add_argument('--bg-dir', default='./backgrounds', help='Background images directory')
-    parser.add_argument('--checkpoint-dir', default='./checkpoints/finetuned/vmamba_heat_all/', help='Checkpoint save directory')
+    parser.add_argument('--checkpoint-dir', default='./checkpoints/finetuned/vmamba_heat_compound3/', help='Checkpoint save directory')
     parser.add_argument('--weights-path', default='./renders/class_weights.pt', help='Class weights cache path')
-    
+    parser.add_argument('--sigma', type=float, default=6.0)
     # Model
     parser.add_argument('--num-classes', type=int, default=11, help='Number of classes')
     parser.add_argument('--mode', default='segment_all', choices=['segment_all', 'segment_six', 'segment_eight'])
     parser.add_argument('--crop-size', type=int, default=256, help='Input image size')
     parser.add_argument('--class-names', type=list, default=['hole_1', 'hole_2', 'hole_3', 'hole_4', 'hole_5', 'hole6', 'hole7', 'hole8', 'hole9', 'hole10', 'center'], help='Name of each keypoint class')
-    parser.add_argument('--sigma', type=float, default=3.0)
     parser.add_argument('--H', type=int, default=720)
     parser.add_argument('--W', type=int, default=1280)
 
@@ -46,7 +45,7 @@ def parse_args():
     parser.add_argument('--accumulation-steps', type=int, default=2, help='Gradient accumulation steps')
     parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
     parser.add_argument('--warmup-epochs', type=int, default=5, help='Warmup epochs')
-    parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
+    parser.add_argument('--patience', type=int, default=30, help='Early stopping patience')
     parser.add_argument('--val-split', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--num-workers', type=int, default=2, help='DataLoader workers')
     
@@ -63,6 +62,9 @@ def parse_args():
     parser.add_argument('--theta', type=float, default=0.5)
     parser.add_argument('--w_weight', type=float, default=1.0)
     parser.add_argument('--mse_weight', type=float, default=0.1)
+    parser.add_argument('--cross_weight', type=float, default=0.05)
+    parser.add_argument('--sharp_weight', type=float, default=0.05)
+    parser.add_argument('--distance_factor', type=float, default=2.5)
     parser.add_argument('--metric_threshold', type=float, default=10.0)
     
     # Regularization
@@ -88,7 +90,8 @@ def main():
         crop_size=(args.crop_size, args.crop_size),
         sigma=args.sigma,
         H=args.H,
-        W=args.W
+        W=args.W,
+        max_N=1750
     )
     print(f"Dataset: {len(dataset)} samples, {args.num_classes} classes, mode={args.mode}")
     
@@ -123,12 +126,16 @@ def main():
         'decoder_lr': args.decoder_lr,
         'start_lr': args.start_lr_factor,
         'weight_decay': args.weight_decay,
+        'sigma': args.sigma,
         'alpha': args.alpha,
         'omega': args.omega,
         'epsilon': args.epsilon,
         'theta': args.theta,
         'w_weight': args.w_weight,
         'mse_weight': args.mse_weight,
+        'cross_weight': args.cross_weight,
+        'sharp_weight': args.sharp_weight,
+        'distance_factor': args.distance_factor,
         'metric_threshold': args.metric_threshold,
         'ema_decay': args.ema_decay,
         'use_ema': not args.no_ema,

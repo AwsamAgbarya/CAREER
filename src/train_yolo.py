@@ -12,7 +12,7 @@ import yaml
 import random
 import json
 '''
-python ./train_yolo.py --rotate 180 --img_size 640
+python ./src/train_yolo.py
 python ./train_yolo.py --skip_dataset_prep --dataset_yaml ./yolov8_dataset/data.yaml --batch_size 8
 '''
 
@@ -40,8 +40,8 @@ def parse_args():
     # Training arguments
     train_group = parser.add_argument_group('Training Parameters')
     train_group.add_argument('--epochs',type=int,default=300,help='Number of training epochs')
-    train_group.add_argument('--batch_size',type=int,default=8 ,help='Training batch size')
-    train_group.add_argument('--img_size',type=int,default=640,help='Input image size for training')
+    train_group.add_argument('--batch_size',type=int,default=4 ,help='Training batch size')
+    train_group.add_argument('--img_size',type=int,default=1280,help='Input image size for training')
     train_group.add_argument('--lr',type=float,default=0.01,help='starting lr rate for training')
     train_group.add_argument('--device',type=int,default=0,help='GPU device ID (use -1 for CPU)')
     
@@ -72,7 +72,7 @@ def fill_mask_holes(mask, hole_size=50):
         Filled binary mask
     """
     # Convert to binary (anything > 0 is foreground)
-    binary_mask = (mask > 0).astype(np.uint8)
+    binary_mask = (mask > 1).astype(np.uint8)
     
     # Fill small holes using morphological operations
     filled_mask = remove_small_holes(binary_mask.astype(bool), area_threshold=hole_size)
@@ -133,7 +133,6 @@ def prepare_dataset(renders_dir, output_dir, backgrounds_dir, train_ratio=0.8, h
         backgrounds_dir: Path to directory containing background images
         train_ratio: Ratio for train/val split (default 0.8)
         hole_size: Maximum hole size to fill in masks
-        rotate: maximum rotation angle
         translate: maximum translation across the screen xy coordinates
     """
     renders_path = Path(renders_dir)

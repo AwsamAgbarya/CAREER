@@ -4,7 +4,6 @@ import torch
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 
-
 @dataclass
 class PoseEstimationResult:
     """Container for pose estimation output."""
@@ -57,8 +56,8 @@ class StereoPnPPoseEstimator:
         self.K_left = camera_matrix_left.astype(np.float64)
         self.K_right = camera_matrix_right.astype(np.float64)
         
-        self.dist_left  = dist_coeffs_left
-        self.dist_right = dist_coeffs_right
+        self.dist_left  = dist_coeffs_left if dist_coeffs_left is not None else np.zeros((4, 1), dtype=np.float64) 
+        self.dist_right = dist_coeffs_right if dist_coeffs_right is not None else np.zeros((4, 1), dtype=np.float64) 
         
         # Stereo extrinsics (left->right transform)
         self.R_stereo = R_stereo if R_stereo is not None else np.eye(3, dtype=np.float64)
@@ -106,6 +105,7 @@ class StereoPnPPoseEstimator:
         # Convert inputs to numpy
         kpts_left, kpts_right = self._prepare_inputs(keypoints_2d, keypoints_3d)
         object_points = keypoints_3d.cpu().numpy().astype(np.float64)
+        # object_points[:, 2] = 0.0
 
         N = len(object_points)
         if N < 4:
@@ -115,6 +115,34 @@ class StereoPnPPoseEstimator:
         initial_result = self._solve_pnp_left_ransac(object_points, kpts_left)
         if not initial_result['success']:
             return self._failed_result("Left camera RANSAC failed")
+        
+        rvec = initial_result['rvec']
+        tvec = initial_result['tvec']
+        inliers = initial_result['inliers']
+
+        if len(inliers) < self.min_inliers:
+            return self._failed_result(f"Insufficient inliers ({len(inliers)} < {self.min_inliers})")
+        
+        if use_refinement:
+            rvec, tvec = self._refine_stereo_pnp(object_points, kpts_left, kpts_right, rvec, tvec, inliers)
+
+        R, _ = cv2.Rodrigues(rvec)
+        
+        reproj_error_left = self._compute_reprojection_error(object_points[inliers], kpts_left[inliers], rvec, tvec, self.K_left, self.dist_left)
+        reproj_error_right = self._compute_reprojection_error(object_points[inliers], kpts_right[inliers], rvec, tvec, self.K_right, self.dist_right,R_cam=self.R_stereo, t_cam=self.t_stereo)
+        self._update_temporal_state(rvec, tvec)
+        
+        return PoseEstimationResult(
+            success=True,
+            rotation_matrix=R,
+            translation_vector=tvec,
+            rvec=rvec,
+            tvec=tvec,
+            inliers=inliers,
+            reprojection_error_left=reproj_error_left,
+            reprojection_error_right=reproj_error_right,
+            num_inliers=len(inliers)
+        )
 
     def _prepare_inputs(self, keypoints_2d, keypoints_3d):
         """Convert torch tensors to numpy and validate shapes."""
@@ -143,8 +171,7 @@ class StereoPnPPoseEstimator:
     
     def _solve_pnp_left_ransac(self, object_points, image_points):
         """Solve PnP with RANSAC on left camera, optionally using temporal warm-start."""
-        flags = cv2.SOLVEPNP_IPPE
-        print(flags)
+        flags = cv2.SOLVEPNP_SQPNP
         use_extrinsic_guess = False
         rvec_init = None
         tvec_init = None
@@ -194,3 +221,79 @@ class StereoPnPPoseEstimator:
             'tvec': tvec,
             'inliers': inliers.flatten()
         }
+    
+    def _refine_stereo_pnp(self, object_points, kpts_left, kpts_right, rvec, tvec, inliers):
+        obj_inliers = object_points[inliers]
+        kpts_l      = kpts_left[inliers]
+        kpts_r      = kpts_right[inliers]
+
+        rvec_ref, tvec_ref = cv2.solvePnPRefineLM(obj_inliers, kpts_l, self.K_left, self.dist_left, rvec, tvec)
+        stereo_calibrated = not np.allclose(self.R_stereo, np.eye(3)) or not np.allclose(self.t_stereo, 0)
+        if not stereo_calibrated:
+            return rvec_ref, tvec_ref 
+
+        R_left, _ = cv2.Rodrigues(rvec_ref)
+        R_right_cam = self.R_stereo @ R_left
+        t_right_cam = self.R_stereo @ tvec_ref + self.t_stereo.reshape(3, 1)  # enforce (3,1)
+        rvec_right, _ = cv2.Rodrigues(R_right_cam)
+
+        try:
+            rvec_ref_r, tvec_ref_r = cv2.solvePnPRefineLM(
+                obj_inliers, kpts_r, self.K_right, self.dist_right,
+                rvec_right, t_right_cam
+            )
+        except cv2.error:
+            return rvec_ref, tvec_ref 
+
+        R_ref_r, _ = cv2.Rodrigues(rvec_ref_r)
+        t_stereo_col = self.t_stereo.reshape(3, 1)   # guarantee (3,1)
+        tvec_ref_r   = tvec_ref_r.reshape(3, 1)       # guarantee (3,1)
+
+        R_back = self.R_stereo.T @ R_ref_r
+        t_back = self.R_stereo.T @ (tvec_ref_r - t_stereo_col)
+        rvec_back, _ = cv2.Rodrigues(R_back)
+        err_left_only  = self._compute_reprojection_error(obj_inliers, kpts_l, rvec_ref,  tvec_ref,  self.K_left, self.dist_left)
+        err_stereo     = self._compute_reprojection_error(obj_inliers, kpts_l, rvec_back, t_back,    self.K_left, self.dist_left)
+
+        if err_left_only <= err_stereo:
+            return rvec_ref, tvec_ref
+        return rvec_back, t_back
+    
+    def _compute_reprojection_error(self, object_points, image_points, rvec, tvec, K, dist, R_cam = None, t_cam = None):
+        """
+        Compute mean reprojection error in pixels.
+        
+        Args:
+            R_cam, t_cam: Optional transform from reference camera to target camera
+        """
+        # Transform pose to target camera if stereo transform provided
+        if R_cam is not None and t_cam is not None:
+            R, _ = cv2.Rodrigues(rvec)
+            R_transformed = R_cam @ R
+            t_transformed = R_cam @ tvec + t_cam
+            rvec_cam, _ = cv2.Rodrigues(R_transformed)
+            tvec_cam = t_transformed
+        else:
+            rvec_cam = rvec
+            tvec_cam = tvec
+        
+        # Project 3D points to image
+        projected, _ = cv2.projectPoints(object_points, rvec_cam, tvec_cam, K, dist)
+        projected = projected.squeeze()
+        
+        # Compute Euclidean distance
+        errors = np.linalg.norm(projected - image_points, axis=1)
+        return float(np.mean(errors))
+    
+    def _update_temporal_state(self, rvec, tvec):
+        """Update temporal tracking state with current pose."""
+        if not self.use_temporal_tracking:
+            return
+        
+        if self.prev_rvec is not None:
+            # Compute velocity as difference
+            self.prev_velocity_rvec = rvec - self.prev_rvec
+            self.prev_velocity_tvec = tvec - self.prev_tvec
+        
+        self.prev_rvec = rvec.copy()
+        self.prev_tvec = tvec.copy()

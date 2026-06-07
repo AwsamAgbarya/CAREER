@@ -6,7 +6,7 @@ from PIL import Image
 from tqdm import tqdm
 from pathlib import Path
 import numpy as np
-
+import json
 import torch
 from torchvision.transforms.functional import pil_to_tensor
 from torchvision.utils import save_image
@@ -65,9 +65,10 @@ def parse_args():
     
     # Data
     parser.add_argument('--data-dir', help='Data image directory that contains "left" and "right" directories')
-    parser.add_argument('--background-dir', help='Augmentation to add backgrounds to the images')
+    parser.add_argument('--background-dir', default="./backgrounds", help='Augmentation to add backgrounds to the images')
+    parser.add_argument('--meta-dir', default="./renders/meta_data", help='Json file with GT 3D keypoint coordinates')
     parser.add_argument('--yolo-weights', default="./checkpoints/finetuned/yolov8s-seg-finetuned/weights/best.pt", help='Data image directory that contains finetuned yolo model weights')
-    parser.add_argument('--vmamba-weights', default="./checkpoints/finetuned/vmamba_heat_all/best.pt")
+    parser.add_argument('--vmamba-weights', default="./checkpoints/finetuned/vmamba_heat_compound2/best.pt")
     parser.add_argument('--process-depths', action='store_true', help='Whether to expect depth maps alongside the images or not')
     parser.add_argument('--crop-size', default=256, help='Tuple of final image size if return-mask is not ON')
 
@@ -87,11 +88,22 @@ def main():
     output_dir = os.path.join(args.data_dir, 'output')
     os.makedirs(output_dir, exist_ok=True)
 
+    obj_model = json.load(open(args.meta_dir + '/object_keypoints.json'))
+    ids = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11']
+    keypoint_coordinates = torch.tensor([[obj_model[id]['x'],obj_model[id]['y'],obj_model[id]['z']] for id in ids])
+    keypoint_coordinates[:-1,2] = keypoint_coordinates[:-1,2].mean()
+    homo_coords = torch.cat([keypoint_coordinates, torch.ones((keypoint_coordinates.shape[0], 1))], dim=1)
+    K = torch.tensor([[800, 0.0, 1280 / 2.0], [0.0, 800, 720 / 2.0], [0.0, 0.0, 1.0]], dtype=torch.float32)
+    K_left = torch.tensor([[800, 0.0, 1280 / 2.0], [0.0, 800, 720 / 2.0], [0.0, 0.0, 1.0]], dtype=torch.float32)
+    pixel_tl_coord_xy = torch.zeros((2))
+
     left_images = sorted(glob.glob(args.data_dir + '/' + left_folder + '/' + '*_rgb.jpeg'))
     left_depths = sorted(glob.glob(args.data_dir + '/' + left_folder + '/' + '*_depth.png'))
 
     right_images = sorted(glob.glob(args.data_dir + '/' + right_folder + '/' + '*_rgb.jpeg'))
     right_depths = sorted(glob.glob(args.data_dir + '/' + right_folder + '/' + '*_depth.png'))
+
+    json_files = sorted(glob.glob(args.meta_dir + '/' + '*_params.json'))
 
     backgrounds = []
     if args.background_dir:
@@ -104,8 +116,7 @@ def main():
             backgrounds.append(pil_to_tensor(bg).float() / 255.0)
 
     N = min([len(left_images) , len(right_images)])
-    # half_h = args.crop_size[0] // 2
-    # half_w = args.crop_size[1] // 2
+    half_hw = args.crop_size // 2
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     detector = InterfaceDetector(weights_path=args.yolo_weights, device=device, mask_mode=False, crop_size=args.crop_size)
@@ -125,19 +136,20 @@ def main():
     for i in range(100):
         left_img = pil_to_tensor(Image.open(left_images[i]).convert('RGB')).float()/255.0
         right_img = pil_to_tensor(Image.open(right_images[i]).convert('RGB')).float()/255.0
+        view_model = json.load(open(json_files[i]))
 
         if process_depths:
             left_dp = pil_to_tensor(Image.open(left_depths[i])).float()
             right_dp = pil_to_tensor(Image.open(right_depths[i])).float()
 
-        if len(backgrounds) > 0:
-            bg = backgrounds[np.random.randint(len(backgrounds))]
+            if len(backgrounds) > 0:
+                bg = backgrounds[np.random.randint(len(backgrounds))]
 
-            mask_left = (left_dp == 0).expand(3, -1, -1)
-            mask_right = (right_dp == 0).expand(3, -1, -1)
+                mask_left = (left_dp == 0).expand(3, -1, -1)
+                mask_right = (right_dp == 0).expand(3, -1, -1)
 
-            left_img = torch.where(mask_left, bg, left_img)
-            right_img = torch.where(mask_right, bg, right_img)
+                left_img = torch.where(mask_left, bg, left_img)
+                right_img = torch.where(mask_right, bg, right_img)
 
         start_time = time()
         input = torch.stack([left_img, right_img], dim=0).to(device)
@@ -152,28 +164,41 @@ def main():
         if centers is None or centers[0] is None or centers[1] is None:
             print(f"Didnt find any objects in frame {i}")
             continue
-        save_image(input[0], os.path.join(output_dir, f'input_image_{i}_left.jpeg'))
-        save_image(input[1], os.path.join(output_dir, f'input_image_{i}_right.jpeg'))
-        save_image(cropped_img[0], os.path.join(output_dir, f'output_image_{i}_left.jpeg'))
-        save_image(cropped_img[1], os.path.join(output_dir, f'output_image_{i}_right.jpeg'))
 
-        prediction = predictor(cropped_img)
+        left_proj = torch.linalg.inv(torch.tensor(view_model['c2w_left']))
+        proj_coords = homo_coords @ left_proj.T
+        proj_coords = proj_coords[:, :3] / proj_coords[:, 3:]
+        pixel_tl_coord_xy[0] = centers[0][1] - half_hw
+        pixel_tl_coord_xy[1] = centers[0][0] - half_hw
+        K_left[:2,2] = K[:2,2] - pixel_tl_coord_xy
+        cam_coords = proj_coords @ K_left.T
+        cam_coords = cam_coords[:, :2] / cam_coords[:, 2:]
+
+        kp_coords_gt = cam_coords[:-1]
+        c_coords_gt = cam_coords[-1:]
+
+        # save_image(input[0], os.path.join(output_dir, f'input_image_{i}_left.jpeg'))
+        # save_image(input[1], os.path.join(output_dir, f'input_image_{i}_right.jpeg'))
+        # save_image(cropped_img[0], os.path.join(output_dir, f'output_image_{i}_left.jpeg'))
+        # save_image(cropped_img[1], os.path.join(output_dir, f'output_image_{i}_right.jpeg'))
+
+        heatmaps = predictor(cropped_img)
         
-        keypoints, centers, amps = processor(prediction, save_path=os.path.join(output_dir, f'view_{i}_keypoints.png'), imgs=cropped_img, n_peaks=10)
-        # res_l, res_r = filterer(keypoints, centers, amps, os.path.join(output_dir, f'view_{i}_vecs.png') )
+        keypoints, centers, amps = processor(heatmaps, save_path=f'./renders/test/output/view_{i}_keypoints.png', imgs=cropped_img)
+        res_l, res_r, res_gt = filterer(keypoints, centers, kp_coords_gt, c_coords_gt, amps, f'./renders/test/output/view_{i}_vecs.png' )
 
-        # left_labels = res_l['labels'][res_l['keep']]
-        # left_kp = res_l['keypoints']
-        # left_kp_coords = torch.empty_like(left_kp[res_l['keep']])
-        # left_kp_coords = left_kp[left_labels-1]
-        # left_coords = torch.concat([left_kp_coords, res_l['center'][None,:]], dim=0)
+        left_labels = res_l['labels'][res_l['keep']]
+        left_kp = res_l['keypoints']
+        left_kp_coords = torch.empty_like(left_kp[res_l['keep']])
+        left_kp_coords = left_kp[left_labels-1]
+        left_coords = torch.concat([left_kp_coords, res_l['center'][None,:]], dim=0)
 
 
-        # right_labels = res_r['labels'][res_r['keep']]
-        # right_kp = res_r['keypoints']
-        # right_kp_coords = torch.empty_like(right_kp[res_r['keep']])
-        # right_kp_coords = right_kp[right_labels-1]
-        # right_coords = torch.concat([right_kp_coords, res_r['center'][None,:]], dim=0)
+        right_labels = res_r['labels'][res_r['keep']]
+        right_kp = res_r['keypoints']
+        right_kp_coords = torch.empty_like(right_kp[res_r['keep']])
+        right_kp_coords = right_kp[right_labels-1]
+        right_coords = torch.concat([right_kp_coords, res_r['center'][None,:]], dim=0)
         
         # if process_depths:
         #     # left_dp = pil_to_tensor(Image.open(left_depths[i])).float()
@@ -204,6 +229,7 @@ def main():
 
         timer.append(time()-start_time)
     print(f"Average timeframe processing time: {torch.tensor(timer).mean()*1000:3f}ms")
+
 if __name__ == '__main__':
     main()
 

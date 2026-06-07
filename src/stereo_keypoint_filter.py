@@ -33,13 +33,9 @@ class StereoKeypointPipeline:
         res_L = self.label(keypoints[0], centers[0], amps[0])
         res_R = self.label(keypoints[1], centers[1], amps[1])
         res_gt = self.label(gt_2d, gt_c, torch.ones((gt_2d.shape[0], 1)))
-        print(res_gt['labels'])
         gt_slot_to_idx = np.argsort(res_gt['labels'])
-        print(gt_2d)
         gt_2d = gt_2d[gt_slot_to_idx[res_L['labels'] - 1]] 
-        print(gt_2d)
         res_gt = self.label(gt_2d, gt_c, torch.ones((gt_2d.shape[0], 1)))
-        print(res_gt['labels'])
 
         assert len(res_L['valid']) == len(res_R['valid'])
         N = len(res_L['valid'])

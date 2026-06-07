@@ -7,7 +7,7 @@ class HeatmapProcessor:
     def __init__(self):
         pass
 
-    def __call__(self, prediction, imgs=None, save_path=None, n_peaks=10, peaks_per_c=2, min_local_dist=3, threshold_rel=0.10, sigma_suppress=15.0):
+    def __call__(self, prediction, imgs=None, save_path=None, n_peaks=10, min_local_dist=3, threshold_rel=0.10):
         if prediction.ndim == 3:
             prediction = prediction.unsqueeze(-1)
         B, C, H, W = prediction.shape
@@ -30,13 +30,10 @@ class HeatmapProcessor:
             keypoints = torch.clamp(keypoints - center,min=0)
 
             # Extract 10 highest keypoint peaks
-            keypoint_coords[i], amps[i] = soft_nms(
+            keypoint_coords[i], amps[i] = extract_peaks_per_channel(
                 keypoints,
-                n_peaks           = n_peaks,
-                peaks_per_channel = peaks_per_c,  # max local maxima extracted per channel
-                min_local_dist    = min_local_dist, # neighbourhood radius for local-max search
-                threshold_rel     = threshold_rel,  # per-channel floor: fraction of ch max
-                sigma_suppress    = sigma_suppress,  # Gaussian σ (px) for score suppression
+                min_local_dist=min_local_dist,
+                threshold_rel=threshold_rel,
             )
 
             flat_idx = torch.argmax(center)
@@ -80,74 +77,83 @@ def find_local_maxima_2d(score_map, min_distance = 6, threshold_rel = 0.05):
     order  = torch.argsort(vals, descending=True)
     return ys[order], xs[order], vals[order]
 
-def soft_nms(heatmap, n_peaks = 10, peaks_per_channel = 3, min_local_dist = 5, threshold_rel = 0.10, sigma_suppress = 20.0):
+def extract_peaks_per_channel(heatmap, min_local_dist=3, threshold_rel=0.10):
     """
-    Two-stage extraction designed for ambiguous multi-peak heatmaps.
-    1. Find candidate pool across channels
-    2. Apply greedy max with a gaussian penalty per choice
-
-    Parameters
-    ----------
-    heatmap        : tensor of shape (C, H, W)
-    sigma_suppress : set to roughly half the expected inter-keypoint
-                     distance in pixels. Smaller → more peaks survive
-                     near each other; larger → sparser output.
-
-    Returns
-    -------
-    peaks : tensor of shape (N, 2) with columns [x, y], length ≤ n_peaks
+    One peak per channel — no cross-channel suppression.
+    Returns coords (C, 2) as [x, y] and amps (C,).
     """
-    device = heatmap.device
-    candidates_yx  = []   # list of [y, x] int tensors
-    candidates_score = [] # list of scalar tensors (raw score)
+    C, H, W = heatmap.shape
+    coords, amps = [], []
 
-    for c in range(heatmap.shape[0]):
-        ch     = heatmap[c]
+    for c in range(C):
+        ch = heatmap[c]
         ch_max = ch.max()
-        if ch_max < 1e-9:
+
+        if ch_max < 1e-9:                           # dead channel → image centre
+            coords.append(torch.tensor([W // 2, H // 2], dtype=torch.long))
+            amps.append(torch.tensor(0.0))
             continue
 
-        ch_norm = ch / ch_max
-        ys, xs, _ = find_local_maxima_2d(
-            ch_norm,
+        ys, xs, vals = find_local_maxima_2d(
+            ch / ch_max,
             min_distance=min_local_dist,
             threshold_rel=threshold_rel,
         )
-        for y, x in zip(ys[:peaks_per_channel], xs[:peaks_per_channel]):
-            candidates_yx.append(torch.stack([y, x]))
-            candidates_score.append(heatmap[c, y, x])
 
-    if not candidates_yx:
-        return torch.zeros((0, 2), dtype=torch.long, device=device)
+        if len(ys) == 0:                            # no local max → global argmax
+            flat_idx = torch.argmax(ch)
+            y, x = flat_idx // W, flat_idx % W
+            val  = ch[y, x]
+        else:
+            y, x, val = ys[0], xs[0], vals[0]      # sorted descending already
 
-    # arr : (N, 2) — [y, x] per candidate
-    arr    = torch.stack(candidates_yx).float()
-    scores = torch.stack(candidates_score).float()
-    scores = scores.clone()                                      # avoid in-place modification of heatmap values
+        coords.append(torch.stack([x, y]))
+        amps.append(ch[y, x])                       # raw (not normalized) amplitude
 
-    selected = []
-    amps = []
+    return torch.stack(coords).to(dtype=torch.long), torch.stack(amps)
 
-    for idx in range(n_peaks):
-        if scores.max() < 1e-9:
-            break
+def cross_channel_nms(coords, amps, min_dist: float = 8.0):
+    """
+    Suppress peaks from *different* channels that are too close together.
+    Greedily keeps the highest-amplitude peak; any lower-amplitude peak from
+    a different channel within `min_dist` pixels is suppressed (amplitude 
+    zeroed, coord replaced with image-centre sentinel).
 
-        best = torch.argmax(scores)
-        by   = arr[best, 0]
-        bx   = arr[best, 1]
-        selected.append(torch.stack([bx, by]))
-        amps.append(scores[best].item())
+    Parameters
+    ----------
+    coords   : (C, 2) long tensor  [x, y]
+    amps     : (C,)   float tensor
+    min_dist : minimum allowed Euclidean distance between cross-channel peaks
 
-        # Gaussian soft suppression
-        d_sq    = (arr[:, 0] - by) ** 2 + (arr[:, 1] - bx) ** 2
-        penalty = torch.exp(-d_sq / (2.0 * sigma_suppress ** 2))
-        scores *= (1.0 - penalty)
+    Returns
+    -------
+    coords, amps  — same shape, suppressed entries zeroed out
+    suppressed    — (C,) bool mask so callers can distinguish dead vs suppressed
+    """
+    C = coords.shape[0]
+    suppressed = torch.zeros(C, dtype=torch.bool)
 
-    if not selected:
-        return torch.zeros((0, 2), dtype=torch.long, device=device), torch.zeros((0, 2), dtype=torch.long, device=device)
-    
-    return torch.stack(selected).to(dtype=torch.long), torch.tensor(amps)
+    # Process in descending amplitude order so the strongest peak always wins
+    order = torch.argsort(amps, descending=True)
 
+    for rank_i in range(C):
+        ci = order[rank_i]
+        if suppressed[ci]:
+            continue
+        for rank_j in range(rank_i + 1, C):
+            cj = order[rank_j]
+            if suppressed[cj]:
+                continue
+            dist = torch.norm(coords[ci].float() - coords[cj].float())
+            if dist < min_dist:
+                suppressed[cj] = True
+
+    coords = coords.clone()
+    amps   = amps.clone()
+    amps[suppressed] = 0.0
+    # Sentinel so downstream code can tell these apart from true dead channels
+    coords[suppressed] = -1
+    return coords, amps, suppressed
 
 def plot_sidebyside_keypoints(images, coords, output_path, radius = 3, color = "lime", linewidth = 1.5, figsize = (16, 8), labels = None, titles = ("Left", "Right")):
     assert images.shape[0] == 2 and coords.shape[0] == 2, \
