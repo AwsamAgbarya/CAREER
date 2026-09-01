@@ -136,29 +136,7 @@ def load_ply(path, keypoint_id, device="cuda"):
     return means, scales, quats, rgbs, opacities, kp_ids
 
 
-def render_image(
-    ply_object_path: str,
-    keypoint_dir: str,
-    viewmat: torch.Tensor,
-    focal: float,
-    width: int,
-    height: int,
-    out_img_path: str,
-    out_mask_path: str,
-    out_depth_path: str,
-    near: float = 0.01,
-    far: float = 100.0,
-    device = "cuda"
-):
-    """
-    Render an image and semantic mask from object and multiple keypoint PLY files.
-    """
-    os.makedirs(os.path.dirname(out_img_path), exist_ok=True)
-    os.makedirs(os.path.dirname(out_mask_path), exist_ok=True)
-    os.makedirs(os.path.dirname(out_depth_path), exist_ok=True)
-    viewmat_torch = viewmat.to(device).float()
-
-    # Load object (keypoint_id=0)
+def load_scene(ply_object_path: str, keypoint_dir: str, device="cuda"):
     means_list, scales_list, quats_list, rgbs_list, ops_list, kp_ids_list = [], [], [], [], [], []
     
     means_obj, scales_obj, quats_obj, rgbs_obj, ops_obj, kp_ids_obj = load_ply(os.path.join(ply_object_path, "interface.ply"), 1, device)
@@ -201,6 +179,32 @@ def render_image(
     all_rgbs = torch.cat(rgbs_list, dim=0)
     all_opacities = torch.cat(ops_list, dim=0)
     all_kp_ids = torch.cat(kp_ids_list, dim=0)
+    
+    return means, scales, quats, all_rgbs, all_opacities, all_kp_ids, num_classes
+
+@torch.inference_mode()
+def render_image(
+    scene_data,
+    viewmat: torch.Tensor,
+    focal: float,
+    width: int,
+    height: int,
+    out_img_path: str,
+    out_mask_path: str,
+    out_depth_path: str,
+    near: float = 0.01,
+    far: float = 100.0,
+    device = "cuda"
+):
+    """
+    Render an image and semantic mask from object and multiple keypoint PLY files.
+    """
+    os.makedirs(os.path.dirname(out_img_path), exist_ok=True)
+    os.makedirs(os.path.dirname(out_mask_path), exist_ok=True)
+    os.makedirs(os.path.dirname(out_depth_path), exist_ok=True)
+    viewmat_torch = viewmat.to(device).float()
+
+    means, scales, quats, all_rgbs, all_opacities, all_kp_ids, num_classes = scene_data
 
     # use homogeneous coords to project to image space
     means_hom = torch.cat([means, torch.ones(means.shape[0], 1, device=device, dtype=means.dtype)], dim=1)
@@ -228,7 +232,7 @@ def render_image(
         [[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]],
         device=device, dtype=torch.float32,
     ).view(1, 1, 3, 3)
-
+    
     render_output, render_alphas, _ = rasterization(
         means_batch, quats_batch, scales_batch, alphas_batch,
         features_batch, viewmats_batch, Ks, width, height, near, far,
@@ -476,6 +480,20 @@ def get_z_rotation_matrix(angle_deg, device='cuda'):
         [0,  0, 1]
     ], device=device, dtype=torch.float32)
 
+def stereo(c2w_center, baseline):
+    # Compute Stereo Offsets 
+    R = c2w_center[:3, :3]
+    center_pos = c2w_center[:3, 3]
+    right_vec_world = c2w_center[:3, 0] 
+
+    # Calculate Rigid Offsets
+    pos_left = center_pos - (right_vec_world * (baseline * 0.5))
+    pos_right = center_pos + (right_vec_world * (baseline * 0.5))
+    # Construct W2C Matrices for Left/Right
+    R_w2c = R.T
+
+    return R_w2c, pos_left, pos_right, center_pos
+
 def generate_stereo_cameras_rigid(num_pairs, baseline, radius_range, theta_range_deg, rot_angles=None, num_keypoints=8):
     """
     Generates RIGID stereo camera pairs (Parallel axes) with optional Z-axis orbit (object rotation simulation).
@@ -486,12 +504,15 @@ def generate_stereo_cameras_rigid(num_pairs, baseline, radius_range, theta_range
     # Generate base Center views
     center_views_w2c = random_trajectory_bottom_cone(num_pairs, num_keypoints, radius_range, theta_range_deg)
     
-    left_views = []
-    right_views = []
+    left_non_orbited = []
+    right_non_orbited = []
+    left_orbited = []
+    right_orbited = []
     
     for i in range(num_pairs):
         w2c_center = center_views_w2c[i]
         c2w_center = torch.linalg.inv(w2c_center)
+        c2w_base = c2w_center.clone()
         
         # Apply Orbit Rotation
         if rot_angles is not None:
@@ -500,32 +521,36 @@ def generate_stereo_cameras_rigid(num_pairs, baseline, radius_range, theta_range
             c2w_center[:3, 3] = R_orbit @ c2w_center[:3, 3]
             c2w_center[:3, :3] = R_orbit @ c2w_center[:3, :3]
 
-        # Compute Stereo Offsets 
-        R = c2w_center[:3, :3]
-        center_pos = c2w_center[:3, 3]
-        right_vec_world = c2w_center[:3, 0] 
-        
-        # Calculate Rigid Offsets
-        pos_left = center_pos - (right_vec_world * (baseline * 0.5))
-        pos_right = center_pos + (right_vec_world * (baseline * 0.5))
-        
-        # Construct W2C Matrices for Left/Right
-        R_w2c = R.T 
+        R_w2c_orbited, pos_left_orbited, pos_right_orbited, center_pos_orbited = stereo(c2w_center, baseline)
+        R_w2c_base, pos_left_base, pos_right_base, center_pos_base = stereo(c2w_base, baseline)
         
         # Left Camera
-        w2c_left = torch.eye(4, device=center_pos.device)
-        w2c_left[:3, :3] = R_w2c
-        w2c_left[:3, 3] = -torch.matmul(R_w2c, pos_left)
+        w2c_left_orbited = torch.eye(4, device=center_pos_orbited.device)
+        w2c_left_orbited[:3, :3] = R_w2c_orbited
+        w2c_left_orbited[:3, 3] = -torch.matmul(R_w2c_orbited, pos_left_orbited)
         
         # Right Camera
-        w2c_right = torch.eye(4, device=center_pos.device)
-        w2c_right[:3, :3] = R_w2c
-        w2c_right[:3, 3] = -torch.matmul(R_w2c, pos_right)
+        w2c_right_orbited = torch.eye(4, device=center_pos_orbited.device)
+        w2c_right_orbited[:3, :3] = R_w2c_orbited
+        w2c_right_orbited[:3, 3] = -torch.matmul(R_w2c_orbited, pos_right_orbited)
         
-        left_views.append(w2c_left)
-        right_views.append(w2c_right)
+        # Left Camera (Base)
+        w2c_left_base = torch.eye(4, device=center_pos_base.device)
+        w2c_left_base[:3, :3] = R_w2c_base
+        w2c_left_base[:3, 3] = -torch.matmul(R_w2c_base, pos_left_base)
         
-    return torch.stack(left_views), torch.stack(right_views)
+        # Right Camera (Base)
+        w2c_right_base = torch.eye(4, device=center_pos_base.device)
+        w2c_right_base[:3, :3] = R_w2c_base
+        w2c_right_base[:3, 3] = -torch.matmul(R_w2c_base, pos_right_base)
+        
+        left_orbited.append(w2c_left_orbited)
+        right_orbited.append(w2c_right_orbited)
+        
+        left_non_orbited.append(w2c_left_base)
+        right_non_orbited.append(w2c_right_base)
+        
+    return torch.stack(left_orbited), torch.stack(right_orbited), torch.stack(left_non_orbited), torch.stack(right_non_orbited)
 
 def extract_keypoint_3d_centers(keypoint_dir, output_json_path, baseline, focal, H, W, weight_by_opacity = True):
     """
@@ -610,6 +635,9 @@ if __name__ == "__main__":
     os.makedirs(os.path.join(out_dir, "meta_data"), exist_ok=True)
     extract_keypoint_3d_centers(keypoint_ply, os.path.join(out_dir, "meta_data", "object_keypoints.json"), args.baseline, focal, H, W)
 
+    print("Loading scene data...")
+    scene_data = load_scene(base_ply, keypoint_ply, device="cuda")
+
     # TRAIN GENERATION
     print("Generating Training Data...")
     train_views = random_view_bottom_cone(num_train, args.radius_range, args.theta_range)
@@ -640,7 +668,7 @@ if __name__ == "__main__":
         
 
         render_image(
-            ply_object_path=base_ply, keypoint_dir=keypoint_ply,
+            scene_data=scene_data,
             viewmat=view_w2c, focal=focal, width=W, height=H,
             out_img_path=rgb_path, out_mask_path=mask_path, out_depth_path=depth_path,
             near=near, far=far
@@ -657,14 +685,14 @@ if __name__ == "__main__":
         smooth_transition_frames=args.smooth_transition_frames
         )
     if args.stereo_test:
-        left_views, right_views = generate_stereo_cameras_rigid(num_test, args.baseline, args.radius_range, args.theta_range, rot_angles=rot_angles, num_keypoints=args.num_keypoints)
+        left_views, right_views, left_views_base, right_views_base = generate_stereo_cameras_rigid(num_test, args.baseline, args.radius_range, args.theta_range, rot_angles=rot_angles, num_keypoints=args.num_keypoints)
         
         for i in tqdm(range(num_test), desc="Testing"):
             rot_deg = rot_angles[i]
 
             # Render Left
             render_image(
-                ply_object_path=base_ply, keypoint_dir=keypoint_ply,
+                scene_data=scene_data,
                 viewmat=left_views[i], focal=focal, width=W, height=H,
                 out_img_path=os.path.join(test_dir_left, f"view_{i:04d}_rgb.jpeg"),
                 out_mask_path=os.path.join(test_dir_left, f"view_{i:04d}_mask.png"),
@@ -673,7 +701,7 @@ if __name__ == "__main__":
             )
             # Render Right
             render_image(
-                ply_object_path=base_ply, keypoint_dir=keypoint_ply,
+                scene_data=scene_data,
                 viewmat=right_views[i], focal=focal, width=W, height=H,
                 out_img_path=os.path.join(test_dir_right, f"view_{i:04d}_rgb.jpeg"),
                 out_mask_path=os.path.join(test_dir_right, f"view_{i:04d}_mask.png"),
@@ -681,16 +709,13 @@ if __name__ == "__main__":
                 near=near, far=far
             )
             
-            # Save Combined JSON
-            c2w_left = torch.linalg.inv(left_views[i])
-            c2w_right = torch.linalg.inv(right_views[i])
-            
             params = {
                 "left_file": f"view_{i:04d}_rgb.jpeg",
                 "right_file": f"view_{i:04d}_rgb.jpeg",
-                "c2w_left": tensor_to_list(c2w_left),
-                "c2w_right": tensor_to_list(c2w_right),
-                "left_w2c": tensor_to_list(left_views[i]),
+                "left_w2c_base": tensor_to_list(left_views_base[i]),
+                "right_w2c_base": tensor_to_list(right_views_base[i]),
+                "left_w2c_orbited": tensor_to_list(left_views[i]),
+                "right_w2c_orbited": tensor_to_list(right_views[i]),
                 "object_rotation_z_deg": float(rot_deg),
                 "object_rotation_matrix": get_z_rotation_matrix(rot_deg).cpu().numpy().tolist()
             }
@@ -721,8 +746,7 @@ if __name__ == "__main__":
                 json.dump(params, f, indent=4)
 
             render_image(
-                ply_object_path=base_ply,
-                keypoint_dir=keypoint_ply,
+                scene_data=scene_data,
                 viewmat=view_w2c,
                 focal=focal,
                 width=W,

@@ -1,28 +1,72 @@
-import numpy as np
-import cv2
-import torch
-from typing import Optional, Tuple, Dict
-from dataclasses import dataclass
+from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Optional
+
+import cv2
+import numpy as np
+from scipy.optimize import least_squares
+
+_EPS = 1e-12
 @dataclass
 class PoseEstimationResult:
-    """Container for pose estimation output."""
     success: bool
-    rotation_matrix: np.ndarray  # 3x3
-    translation_vector: np.ndarray  # 3x1
-    rvec: np.ndarray  # 3x1 Rodrigues vector
-    tvec: np.ndarray  # 3x1
-    inliers: Optional[np.ndarray]  # Nx1 indices
+    rotation_matrix: np.ndarray
+    translation_vector: np.ndarray
+    rvec: np.ndarray
+    tvec: np.ndarray
+    inliers: Optional[np.ndarray]
     reprojection_error_left: float
     reprojection_error_right: float
     num_inliers: int
+    ambiguity_margin: float = 0.0     # runner-up score minus winner's
+    view_cosine: float = 0.0          # >0 face turned toward the camera
+    reason: str = ""
+
+
+def view_cosine(R, t, n_obj) -> float:
+    """
+    Cosine of the angle between the outward face normal and the direction from
+    the face to the camera centre.
+
+        > 0  face turned toward the camera  (visible, keep)
+        < 0  face turned away               (impossible, reject)
+        ~ 0  edge-on, the test is degenerate -- reject the frame instead
+
+    (R, t) is the object->camera pose, n_obj the outward face normal in OBJECT
+    coordinates. The camera centre is the origin of the camera frame, so the
+    face->camera direction is simply -t normalised.
+    """
+    R = np.asarray(R, np.float64).reshape(3, 3)
+    t = np.asarray(t, np.float64).reshape(3)
+    n_cam = R @ np.asarray(n_obj, np.float64).reshape(3)
+    norm = float(np.linalg.norm(t))
+    if norm < _EPS:
+        return 0.0
+    return float(n_cam @ (-t / norm))
+
+def is_face_visible(R, t, n_obj, min_cos: float = 0.0) -> bool:
+    """
+    `min_cos` is a safety margin, expressed as cos(tilt). 0.0 accepts anything
+    that is nominally front-facing. Note that a margin here is usually the
+    wrong tool: at extreme tilt you want the FRAME rejected (layer 3), not the
+    pose silently dropped, because at that point the pose is worthless whether
+    or not it is front-facing.
+    """
+    if n_obj is None:
+        return True
+    return view_cosine(R, t, n_obj) > min_cos
+
+def _failed(reason: str = "") -> PoseEstimationResult:
+    return PoseEstimationResult(
+        success=False, rotation_matrix=np.eye(3), translation_vector=np.zeros((3, 1)),
+        rvec=np.zeros((3, 1)), tvec=np.zeros((3, 1)), inliers=None,
+        reprojection_error_left=float("inf"), reprojection_error_right=float("inf"),
+        num_inliers=0, reason=reason,
+    )
 
 
 class StereoPnPPoseEstimator:
-    """
-    Robust 6DoF pose estimation using stereo keypoint correspondences.
-    """
-    
     def __init__(
         self,
         camera_matrix_left: np.ndarray,
@@ -31,269 +75,279 @@ class StereoPnPPoseEstimator:
         dist_coeffs_right: Optional[np.ndarray] = None,
         R_stereo: Optional[np.ndarray] = None,
         t_stereo: Optional[np.ndarray] = None,
-        ransac_reproj_threshold: float = 4.0,
-        ransac_confidence: float = 0.99,
-        use_temporal_tracking: bool = True,
-        max_temporal_deviation: float = 0.5,
-        min_inliers: int = 4
+        reproj_threshold: float = 4.0,
+        min_inliers: int = 5,
+        planarity_tol: float = 1e-3,
+        huber_scale: float = 3.0,
+        face_normal_obj=None,
+        min_view_cos: float = 0.0,
     ):
-        """
-        Initialize stereo PnP pose estimator.
-        
-        Args:
-            camera_matrix_left: 3x3 intrinsic matrix for left camera
-            camera_matrix_right: 3x3 intrinsic matrix for right camera
-            dist_coeffs_left: Distortion coefficients for left camera (can be None/zeros)
-            dist_coeffs_right: Distortion coefficients for right camera
-            R_stereo: 3x3 rotation from left to right camera (identity if None)
-            t_stereo: 3x1 translation from left to right camera (zeros if None)
-            ransac_reproj_threshold: RANSAC inlier threshold in pixels
-            ransac_confidence: RANSAC confidence level (0-1)
-            use_temporal_tracking: Enable warm-start from previous frame
-            max_temporal_deviation: Maximum allowed pose deviation from prediction (meters)
-            min_inliers: Minimum inliers required for valid pose
-        """
-        self.K_left = camera_matrix_left.astype(np.float64)
-        self.K_right = camera_matrix_right.astype(np.float64)
-        
-        self.dist_left  = dist_coeffs_left if dist_coeffs_left is not None else np.zeros((4, 1), dtype=np.float64) 
-        self.dist_right = dist_coeffs_right if dist_coeffs_right is not None else np.zeros((4, 1), dtype=np.float64) 
-        
-        # Stereo extrinsics (left->right transform)
-        self.R_stereo = R_stereo if R_stereo is not None else np.eye(3, dtype=np.float64)
-        self.t_stereo = t_stereo if t_stereo is not None else np.zeros((3, 1), dtype=np.float64)
-        
-        self.ransac_reproj_threshold = ransac_reproj_threshold
-        self.ransac_confidence = ransac_confidence
-        self.use_temporal_tracking = use_temporal_tracking
-        self.max_temporal_deviation = max_temporal_deviation
-        self.min_inliers = min_inliers
-        
-        # Temporal tracking state
-        self.prev_rvec = None
-        self.prev_tvec = None
-        self.prev_velocity_rvec = None
-        self.prev_velocity_tvec = None
+        self.K_left = np.asarray(camera_matrix_left, np.float64)
+        self.K_right = np.asarray(camera_matrix_right, np.float64)
+        self.dist_left = (np.zeros((5, 1)) if dist_coeffs_left is None
+                          else np.asarray(dist_coeffs_left, np.float64))
+        self.dist_right = (np.zeros((5, 1)) if dist_coeffs_right is None
+                           else np.asarray(dist_coeffs_right, np.float64))
+        self.R_stereo = np.eye(3) if R_stereo is None else np.asarray(R_stereo, np.float64)
+        self.t_stereo = (np.zeros((3, 1)) if t_stereo is None
+                         else np.asarray(t_stereo, np.float64).reshape(3, 1))
+        self.reproj_threshold = float(reproj_threshold)
+        self.min_inliers = int(min_inliers)
+        self.planarity_tol = float(planarity_tol)
+        self.huber_scale = float(huber_scale)
+        self.face_normal_obj = (None if face_normal_obj is None
+                                else np.asarray(face_normal_obj, np.float64).reshape(3))
+        self.min_view_cos = float(min_view_cos)
 
-    def _failed_result(self, reason = "Unknown"):
-        """Return a failed pose estimation result."""
+    def _face_visible(self, rvec, tvec) -> bool:
+        """Layer 2 of the visibility constraint (see face_orientation.py)."""
+        if self.face_normal_obj is None:
+            return True
+        R, _ = cv2.Rodrigues(np.asarray(rvec, np.float64).reshape(3, 1))
+        return is_face_visible(R, tvec, self.face_normal_obj, self.min_view_cos)
+
+    def _view_cos(self, rvec, tvec) -> float:
+        if self.face_normal_obj is None:
+            return 0.0
+        R, _ = cv2.Rodrigues(np.asarray(rvec, np.float64).reshape(3, 1))
+        return view_cosine(R, tvec, self.face_normal_obj)
+
+    # Projection helpers
+    def _project(self, X, rvec, tvec, right: bool):
+        if right:
+            R, _ = cv2.Rodrigues(np.asarray(rvec, np.float64).reshape(3, 1))
+            Rr = self.R_stereo @ R
+            tr = self.R_stereo @ np.asarray(tvec, np.float64).reshape(3, 1) + self.t_stereo
+            rv, _ = cv2.Rodrigues(Rr)
+            p, _ = cv2.projectPoints(X, rv, tr, self.K_right, self.dist_right)
+        else:
+            p, _ = cv2.projectPoints(X, np.asarray(rvec, np.float64).reshape(3, 1),
+                                     np.asarray(tvec, np.float64).reshape(3, 1),
+                                     self.K_left, self.dist_left)
+        return p.reshape(-1, 2)
+
+    def _errors(self, X, uvL, uvR, rvec, tvec):
+        eL = np.linalg.norm(self._project(X, rvec, tvec, False) - uvL, axis=1)
+        eR = np.linalg.norm(self._project(X, rvec, tvec, True) - uvR, axis=1)
+        return eL, eR
+
+    def estimate_pose(
+        self,
+        object_points: np.ndarray,
+        uv_left: np.ndarray,
+        uv_right: np.ndarray,
+        w_left: np.ndarray = None,
+        w_right: np.ndarray = None,
+        predicted_pose: tuple = None,
+        use_right_view: bool = True,
+    ) -> PoseEstimationResult:
+        """
+        object_points : (N, 3) model points in the object rest frame
+        uv_left/right : (N, 2) pixel coordinates, SAME ordering
+        w_left/right  : (N,)   optional positive weights (conf / sigma)
+        predicted_pose: optional (R, t) from the temporal tracker, used both
+                        as an extra initialisation and as the tie-breaker for
+                        the planar mirror ambiguity.
+        """
+        X = np.ascontiguousarray(np.asarray(object_points, np.float64))
+        uvL = np.ascontiguousarray(np.asarray(uv_left, np.float64))
+        uvR = np.ascontiguousarray(np.asarray(uv_right, np.float64))
+        N = len(X)
+        if N < 4 or len(uvL) != N or len(uvR) != N:
+            return _failed(f"need >=4 matched points, got {N}")
+
+        wL = np.ones(N) if w_left is None else np.asarray(w_left, np.float64)
+        wR = np.ones(N) if w_right is None else np.asarray(w_right, np.float64)
+        wL = wL / max(wL.mean(), 1e-9)
+        wR = wR / max(wR.mean(), 1e-9)
+        if not use_right_view:
+            wR = np.zeros_like(wR)
+
+        hyps = self._initial_hypotheses(X, uvL, predicted_pose)
+        if not hyps:
+            return _failed("no PnP hypothesis could be computed")
+
+        scored = []
+        for rvec, tvec, tag in hyps:
+            if tvec is None or not np.isfinite(tvec).all():
+                continue
+            eL, eR = self._errors(X, uvL, uvR, rvec, tvec)
+            comb = eL + (eR if use_right_view else 0.0)
+            thr = self.reproj_threshold * (2.0 if use_right_view else 1.0)
+            inl = comb < max(thr, 1e-6)
+            if inl.sum() < min(self.min_inliers, N):
+                inl = comb <= np.partition(comb, min(self.min_inliers, N) - 1)[
+                    min(self.min_inliers, N) - 1]
+            if inl.sum() < 4:
+                continue
+
+            rv, tv = self._refine(X[inl], uvL[inl], uvR[inl], wL[inl], wR[inl], rvec, tvec)
+            # Refinement is unconstrained, so re-test rather than assume the
+            # hypothesis stayed on the front-facing side of the boundary.
+            if not self._face_visible(rv, tv):
+                continue
+            eL, eR = self._errors(X, uvL, uvR, rv, tv)
+            comb = eL + (eR if use_right_view else 0.0)
+            inl = comb < max(thr, 1e-6)
+            if inl.sum() < 4:
+                continue
+
+            rmsL = float(np.sqrt(np.average(eL[inl] ** 2, weights=np.maximum(wL[inl], 1e-6))))
+            rmsR = float(np.sqrt(np.average(eR[inl] ** 2, weights=np.maximum(wR[inl], 1e-6)))) \
+                if use_right_view else 0.0
+
+            # The right view carries the mirror decision, so it gets full say.
+            score = rmsL + rmsR
+            score += 0.5 * (N - int(inl.sum()))
+            score += self._temporal_cost(rv, tv, predicted_pose)
+            scored.append((score, rv, tv, inl, rmsL, rmsR, tag))
+
+        if not scored:
+            # Distinguish the two failure causes: "everything was back-facing"
+            # usually means the labelling was the mirrored one (fine, the
+            # matcher will be told to try another) or that face_normal_obj is
+            # INVERTED (not fine, and it would otherwise look like a quiet
+            # drop in solve rate).
+            return _failed("all hypotheses rejected"
+                           + (" (all back-facing -- check face_normal_obj sign)"
+                              if self.face_normal_obj is not None else ""))
+
+        scored.sort(key=lambda s: s[0])
+        score, rv, tv, inl, rmsL, rmsR, tag = scored[0]
+        margin = float(scored[1][0] - score) if len(scored) > 1 else float("inf")
+
+        if int(inl.sum()) < self.min_inliers:
+            return _failed(f"only {int(inl.sum())} inliers (< {self.min_inliers})")
+
+        R, _ = cv2.Rodrigues(rv)
         return PoseEstimationResult(
-            success=False,
-            rotation_matrix=np.eye(3),
-            translation_vector=np.zeros((3, 1)),
-            rvec=np.zeros((3, 1)),
-            tvec=np.zeros((3, 1)),
-            inliers=None,
-            reprojection_error_left=float('inf'),
-            reprojection_error_right=float('inf'),
-            num_inliers=0
+            success=True, rotation_matrix=R, translation_vector=tv.reshape(3, 1),
+            rvec=rv.reshape(3, 1), tvec=tv.reshape(3, 1),
+            inliers=np.where(inl)[0], reprojection_error_left=rmsL,
+            reprojection_error_right=rmsR, num_inliers=int(inl.sum()),
+            ambiguity_margin=margin, reason=tag,
         )
 
-    def estimate_pose(self, keypoints_2d, keypoints_3d, use_refinement = True, return_diagnostics = False):
+    def _initial_hypotheses(self, X, uvL, predicted_pose):
         """
-        Estimate 6DoF pose from stereo keypoint correspondences.
-        
-        Args:
-            keypoints_2d: torch.Tensor of shape (2, N, 2) containing [left, right] pixel coords
-            keypoints_3d: np.ndarray of shape (N, 3) containing 3D model keypoints in object frame
-            use_refinement: Whether to apply LM refinement after RANSAC
-            return_diagnostics: Whether to compute detailed diagnostics
-            
-        Returns:
-            PoseEstimationResult containing pose, inliers, and reprojection errors
+        Collect every plausible starting pose. For a planar target IPPE
+        returns the two mirror solutions; keeping BOTH and letting the right
+        camera choose is the fix for the flipping.
         """
-        # Convert inputs to numpy
-        kpts_left, kpts_right = self._prepare_inputs(keypoints_2d, keypoints_3d)
-        object_points = keypoints_3d.cpu().numpy().astype(np.float64)
-        # object_points[:, 2] = 0.0
+        hyps = []
+        plane = self._plane_frame(X)
 
-        N = len(object_points)
-        if N < 4:
-            return self._failed_result("Insufficient keypoints (need ≥4)")
-        
-        # Initial solution
-        initial_result = self._solve_pnp_left_ransac(object_points, kpts_left)
-        if not initial_result['success']:
-            return self._failed_result("Left camera RANSAC failed")
-        
-        rvec = initial_result['rvec']
-        tvec = initial_result['tvec']
-        inliers = initial_result['inliers']
+        if plane is not None:
+            A, c, Xl = plane
+            try:
+                n_sol, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+                    np.ascontiguousarray(Xl), np.ascontiguousarray(uvL),
+                    self.K_left, self.dist_left, flags=cv2.SOLVEPNP_IPPE)
+                for i in range(int(n_sol)):
+                    Rl, _ = cv2.Rodrigues(rvecs[i])
+                    R = Rl @ A.T
+                    t = tvecs[i].reshape(3, 1) - R @ c.reshape(3, 1)
+                    rv, _ = cv2.Rodrigues(R)
+                    hyps.append((rv, t, f"ippe{i}"))
+            except cv2.error:
+                pass
 
-        if len(inliers) < self.min_inliers:
-            return self._failed_result(f"Insufficient inliers ({len(inliers)} < {self.min_inliers})")
-        
-        if use_refinement:
-            rvec, tvec = self._refine_stereo_pnp(object_points, kpts_left, kpts_right, rvec, tvec, inliers)
+        for flag, name in ((cv2.SOLVEPNP_SQPNP, "sqpnp"), (cv2.SOLVEPNP_EPNP, "epnp")):
+            try:
+                ok, rv, tv = cv2.solvePnP(X, uvL, self.K_left, self.dist_left, flags=flag)
+                if ok:
+                    hyps.append((rv, tv, name))
+            except cv2.error:
+                pass
 
-        R, _ = cv2.Rodrigues(rvec)
-        
-        reproj_error_left = self._compute_reprojection_error(object_points[inliers], kpts_left[inliers], rvec, tvec, self.K_left, self.dist_left)
-        reproj_error_right = self._compute_reprojection_error(object_points[inliers], kpts_right[inliers], rvec, tvec, self.K_right, self.dist_right,R_cam=self.R_stereo, t_cam=self.t_stereo)
-        self._update_temporal_state(rvec, tvec)
-        
-        return PoseEstimationResult(
-            success=True,
-            rotation_matrix=R,
-            translation_vector=tvec,
-            rvec=rvec,
-            tvec=tvec,
-            inliers=inliers,
-            reprojection_error_left=reproj_error_left,
-            reprojection_error_right=reproj_error_right,
-            num_inliers=len(inliers)
-        )
+        if predicted_pose is not None:
+            Rp, tp = predicted_pose
+            try:
+                ok, rv, tv = cv2.solvePnP(
+                    X, uvL, self.K_left, self.dist_left,
+                    cv2.Rodrigues(np.asarray(Rp, np.float64))[0],
+                    np.asarray(tp, np.float64).reshape(3, 1),
+                    useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+                if ok:
+                    hyps.append((rv, tv, "warmstart"))
+            except cv2.error:
+                pass
+            hyps.append((cv2.Rodrigues(np.asarray(Rp, np.float64))[0],
+                         np.asarray(tp, np.float64).reshape(3, 1), "prediction"))
 
-    def _prepare_inputs(self, keypoints_2d, keypoints_3d):
-        """Convert torch tensors to numpy and validate shapes."""
-        if isinstance(keypoints_2d, torch.Tensor):
-            keypoints_2d = keypoints_2d.cpu().numpy()
-        
-        assert keypoints_2d.shape[0] == 2, "First dim must be 2 (left, right)"
-        assert keypoints_2d.shape[2] == 2, "Last dim must be 2 (x, y)"
-        assert keypoints_2d.shape[1] == keypoints_3d.shape[0], "Keypoint count mismatch"
-        
-        kpts_left = keypoints_2d[0].astype(np.float32)
-        kpts_right = keypoints_2d[1].astype(np.float32)
-        
-        return kpts_left, kpts_right
-    
-    def _predict_pose_from_velocity(self):
-        """Predict current pose using constant velocity motion model."""
-        if self.prev_velocity_rvec is None:
-            return self.prev_rvec, self.prev_tvec
-        
-        # Constant velocity prediction
-        rvec_pred = self.prev_rvec + self.prev_velocity_rvec
-        tvec_pred = self.prev_tvec + self.prev_velocity_tvec
-        
-        return rvec_pred, tvec_pred
-    
-    def _solve_pnp_left_ransac(self, object_points, image_points):
-        """Solve PnP with RANSAC on left camera, optionally using temporal warm-start."""
-        flags = cv2.SOLVEPNP_SQPNP
-        use_extrinsic_guess = False
-        rvec_init = None
-        tvec_init = None
-        
-        # Temporal warm-start if available
-        if self.use_temporal_tracking and self.prev_rvec is not None:
-            rvec_init, tvec_init = self._predict_pose_from_velocity()
-            
-            # Try warm-started iterative solver first (faster convergence)
-            success, rvec_ws, tvec_ws = cv2.solvePnP(
-                object_points, image_points,
-                self.K_left, self.dist_left,
-                rvec_init, tvec_init,
-                useExtrinsicGuess=True,
-                flags=cv2.SOLVEPNP_ITERATIVE
-            )
-            
-            if success:
-                # Validate pose is physically plausible (not a wild jump)
-                deviation = np.linalg.norm(tvec_ws - tvec_init)
-                if deviation < self.max_temporal_deviation:
-                    # Use warm-start as initial guess for RANSAC
-                    rvec_init = rvec_ws
-                    tvec_init = tvec_ws
-                    use_extrinsic_guess = True
-                    flags = cv2.SOLVEPNP_ITERATIVE
-        
-        # RANSAC with optional warm-start
-        success, rvec, tvec, inliers = cv2.solvePnPRansac(
-            object_points, image_points,
-            self.K_left, None,
-            rvec=rvec_init if use_extrinsic_guess else None,
-            tvec=tvec_init if use_extrinsic_guess else None,
-            useExtrinsicGuess=use_extrinsic_guess,
-            iterationsCount=10000,
-            reprojectionError=self.ransac_reproj_threshold,
-            confidence=self.ransac_confidence,
-            flags=flags
-        )
-        
-        if not success or inliers is None:
-            return {'success': False}
-        
-        return {
-            'success': True,
-            'rvec': rvec,
-            'tvec': tvec,
-            'inliers': inliers.flatten()
-        }
-    
-    def _refine_stereo_pnp(self, object_points, kpts_left, kpts_right, rvec, tvec, inliers):
-        obj_inliers = object_points[inliers]
-        kpts_l      = kpts_left[inliers]
-        kpts_r      = kpts_right[inliers]
+        # Keep only hypotheses that put the object in front of the camera
+        # AND turn the interface face toward it.
+        return [(rv, tv, tag) for rv, tv, tag in hyps
+                if tv is not None and np.isfinite(np.asarray(tv)).all()
+                and float(np.asarray(tv).reshape(3)[2]) > 0
+                and self._face_visible(rv, tv)]
 
-        rvec_ref, tvec_ref = cv2.solvePnPRefineLM(obj_inliers, kpts_l, self.K_left, self.dist_left, rvec, tvec)
-        stereo_calibrated = not np.allclose(self.R_stereo, np.eye(3)) or not np.allclose(self.t_stereo, 0)
-        if not stereo_calibrated:
-            return rvec_ref, tvec_ref 
+    def _plane_frame(self, X):
+        """Return (A, centroid, X_local) with X_local[:, 2] ~ 0, or None."""
+        c = X.mean(axis=0)
+        try:
+            _, S, Vt = np.linalg.svd(X - c, full_matrices=True)
+        except np.linalg.LinAlgError:
+            return None
+        if S[0] < 1e-12 or S[2] > self.planarity_tol * S[0]:
+            return None
+        A = Vt.T.copy()
+        if np.linalg.det(A) < 0:
+            A[:, 2] *= -1.0
+        Xl = np.ascontiguousarray((X - c) @ A)
+        Xl[:, 2] = 0.0
+        return A, c, Xl
 
-        R_left, _ = cv2.Rodrigues(rvec_ref)
-        R_right_cam = self.R_stereo @ R_left
-        t_right_cam = self.R_stereo @ tvec_ref + self.t_stereo.reshape(3, 1)  # enforce (3,1)
-        rvec_right, _ = cv2.Rodrigues(R_right_cam)
+    def _refine(self, X, uvL, uvR, wL, wR, rvec, tvec):
+        """Weighted Huber LM over BOTH views at once."""
+        p0 = np.concatenate([np.asarray(rvec, np.float64).reshape(3),
+                             np.asarray(tvec, np.float64).reshape(3)])
+
+        def resid(p):
+            rv, tv = p[:3], p[3:]
+            rL = (self._project(X, rv, tv, False) - uvL) * wL[:, None]
+            rR = (self._project(X, rv, tv, True) - uvR) * wR[:, None]
+            return np.concatenate([rL.ravel(), rR.ravel()])
 
         try:
-            rvec_ref_r, tvec_ref_r = cv2.solvePnPRefineLM(
-                obj_inliers, kpts_r, self.K_right, self.dist_right,
-                rvec_right, t_right_cam
-            )
-        except cv2.error:
-            return rvec_ref, tvec_ref 
+            sol = least_squares(resid, p0, method="trf", loss="huber",
+                                f_scale=self.huber_scale, max_nfev=120)
+            if sol.success or sol.status > 0:
+                return sol.x[:3].reshape(3, 1), sol.x[3:].reshape(3, 1)
+        except Exception:
+            pass
+        return np.asarray(rvec, np.float64).reshape(3, 1), np.asarray(tvec, np.float64).reshape(3, 1)
 
-        R_ref_r, _ = cv2.Rodrigues(rvec_ref_r)
-        t_stereo_col = self.t_stereo.reshape(3, 1)   # guarantee (3,1)
-        tvec_ref_r   = tvec_ref_r.reshape(3, 1)       # guarantee (3,1)
+    @staticmethod
+    def _temporal_cost(rvec, tvec, predicted_pose):
+        if predicted_pose is None:
+            return 0.0
+        Rp, tp = predicted_pose
+        R, _ = cv2.Rodrigues(np.asarray(rvec, np.float64).reshape(3, 1))
+        dR = np.asarray(Rp, np.float64).T @ R
+        ang = np.degrees(np.arccos(np.clip((np.trace(dR) - 1.0) / 2.0, -1.0, 1.0)))
+        dt = float(np.linalg.norm(np.asarray(tvec).reshape(3) - np.asarray(tp).reshape(3)))
+        # Deliberately gentle: this nudges the mirror decision, it must never
+        # be able to hold a genuinely moving object in place.
+        return 0.04 * ang + 2.0 * dt
 
-        R_back = self.R_stereo.T @ R_ref_r
-        t_back = self.R_stereo.T @ (tvec_ref_r - t_stereo_col)
-        rvec_back, _ = cv2.Rodrigues(R_back)
-        err_left_only  = self._compute_reprojection_error(obj_inliers, kpts_l, rvec_ref,  tvec_ref,  self.K_left, self.dist_left)
-        err_stereo     = self._compute_reprojection_error(obj_inliers, kpts_l, rvec_back, t_back,    self.K_left, self.dist_left)
-
-        if err_left_only <= err_stereo:
-            return rvec_ref, tvec_ref
-        return rvec_back, t_back
-    
-    def _compute_reprojection_error(self, object_points, image_points, rvec, tvec, K, dist, R_cam = None, t_cam = None):
+    def score_correspondence(self, uv_left, uv_right, object_points, predicted_pose=None) -> float:
         """
-        Compute mean reprojection error in pixels.
-        
-        Args:
-            R_cam, t_cam: Optional transform from reference camera to target camera
+        Scorer for StereoRingMatcher's `pose_scorer` hook.
+
+        Deliberately NOT `reprojection_error_left + right`: those are computed
+        over INLIERS only, so a wrong labelling that manages to explain just
+        five of the ten points scores better than the right one that explains
+        all ten. The cost here is a truncated (M-estimator) mean over EVERY
+        supplied point in both views, so failing to explain a point costs the
+        full clamp instead of being quietly excluded.
         """
-        # Transform pose to target camera if stereo transform provided
-        if R_cam is not None and t_cam is not None:
-            R, _ = cv2.Rodrigues(rvec)
-            R_transformed = R_cam @ R
-            t_transformed = R_cam @ tvec + t_cam
-            rvec_cam, _ = cv2.Rodrigues(R_transformed)
-            tvec_cam = t_transformed
-        else:
-            rvec_cam = rvec
-            tvec_cam = tvec
-        
-        # Project 3D points to image
-        projected, _ = cv2.projectPoints(object_points, rvec_cam, tvec_cam, K, dist)
-        projected = projected.squeeze()
-        
-        # Compute Euclidean distance
-        errors = np.linalg.norm(projected - image_points, axis=1)
-        return float(np.mean(errors))
-    
-    def _update_temporal_state(self, rvec, tvec):
-        """Update temporal tracking state with current pose."""
-        if not self.use_temporal_tracking:
-            return
-        
-        if self.prev_rvec is not None:
-            # Compute velocity as difference
-            self.prev_velocity_rvec = rvec - self.prev_rvec
-            self.prev_velocity_tvec = tvec - self.prev_tvec
-        
-        self.prev_rvec = rvec.copy()
-        self.prev_tvec = tvec.copy()
+        X = np.ascontiguousarray(np.asarray(object_points, np.float64))
+        uvL = np.ascontiguousarray(np.asarray(uv_left, np.float64))
+        uvR = np.ascontiguousarray(np.asarray(uv_right, np.float64))
+        r = self.estimate_pose(X, uvL, uvR, predicted_pose=predicted_pose)
+        if not r.success:
+            return float("inf")
+        eL, eR = self._errors(X, uvL, uvR, r.rvec, r.tvec)
+        clamp = 3.0 * self.reproj_threshold
+        return float(np.mean(np.minimum(eL, clamp) + np.minimum(eR, clamp)))
